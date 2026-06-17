@@ -1,0 +1,15 @@
+services:
+  flibusta-bot:
+    build: .
+    container_name: flibusta-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - ./data:/data
+    tmpfs:
+      - /tmp/flibusta-downloads:size=200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
