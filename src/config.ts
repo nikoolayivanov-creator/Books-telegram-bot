@@ -8,8 +8,8 @@ const Env = z.object({
   ALLOWED_IDS: z.string().optional(),
   ADMIN_IDS: z.string().min(1),
   UNLIMITED_IDS: z.string().optional(),
-  ZAI_API_KEY: z.string().min(1),
-  ZAI_BASE: z.string().url(),
+  LLM_API_KEY: z.string().min(1),
+  LLM_BASE: z.string().url(),
   MODEL: z.string().min(1),
   FLIBUSTA_BASE: z.string().url(),
   FLIBUSTA_FALLBACK_BASE: z.preprocess(
@@ -31,8 +31,8 @@ export type Config = {
   botToken: string;
   allowedIds: number[];
   adminIds: number[];
-  zaiApiKey: string;
-  zaiBase: string;
+  llmApiKey: string;
+  llmBase: string;
   model: string;
   flibustaBase: string;
   flibustaFallbackBase?: string;
@@ -54,8 +54,8 @@ export function loadConfig(): Config {
     allowedIds: e.ALLOWED_IDS ? csv(e.ALLOWED_IDS) : [],
     unlimitedIds: e.UNLIMITED_IDS ? csv(e.UNLIMITED_IDS) : [],
     adminIds: csv(e.ADMIN_IDS),
-    zaiApiKey: e.ZAI_API_KEY,
-    zaiBase: e.ZAI_BASE,
+    llmApiKey: e.LLM_API_KEY,
+    llmBase: e.LLM_BASE,
     model: e.MODEL,
     flibustaBase: e.FLIBUSTA_BASE,
     flibustaFallbackBase: e.FLIBUSTA_FALLBACK_BASE,
@@ -65,7 +65,7 @@ export function loadConfig(): Config {
     searchCacheTtlSec: e.SEARCH_CACHE_TTL_SEC ? Number(e.SEARCH_CACHE_TTL_SEC) : 21600,
     searchCacheMax: e.SEARCH_CACHE_MAX ? Number(e.SEARCH_CACHE_MAX) : 2000,
     maxQueryLen: e.MAX_QUERY_LEN ? Number(e.MAX_QUERY_LEN) : 100,
-    downloadDailyLimit: e.DOWNLOAD_DAILY_LIMIT ? Number(e.DOWNLOAD_DAILY_LIMIT) : 5,
-    searchDailyLimit: e.SEARCH_DAILY_LIMIT ? Number(e.SEARCH_DAILY_LIMIT) : 20,
+    downloadDailyLimit: e.DOWNLOAD_DAILY_LIMIT ? Number(e.DOWNLOAD_DAILY_LIMIT) : 10,
+    searchDailyLimit: e.SEARCH_DAILY_LIMIT ? Number(e.SEARCH_DAILY_LIMIT) : 50,
   };
 }

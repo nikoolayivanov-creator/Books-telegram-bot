@@ -9,6 +9,7 @@ import { createLlm } from "./search/llm.js";
 import { createFlibusta, type Flibusta, type FlibustaBook } from "./search/flibusta.js";
 import { createDownloader } from "./download.js";
 import { bookListKeyboard, formatsKeyboard, bookListText, bookCardText } from "./keyboards.js";
+import { createStatusMessenger, type StatusMessenger, type MsgRef } from "./status.js";
 
 export type HandlerCtx = {
   from?: { id: number };
@@ -24,7 +25,7 @@ export type HandlerCtx = {
 
 // Семафор: ограничивает число параллельных дорогих операций. При неблокирующих
 // обработчиках без него спам-очередь выливается в десяток одновременных вызовов
-// flibusta/z.ai — риск троттлинга и бана upstream.
+// flibusta/LLM — риск троттлинга и бана upstream.
 function makeSemaphore(max: number) {
   let active = 0;
   const queue: (() => void)[] = [];
@@ -47,7 +48,15 @@ export function createBotHandlers(
   analytics: Analytics,
   downloader: ReturnType<typeof createDownloader>,
   flibusta: Flibusta,
+  messenger?: StatusMessenger,
 ) {
+  // Статус-сообщения (прогресс скачивания, фазы поиска). Опционально: тестам,
+  // которым статус не нужен, передавать фейк не требуется — no-op по умолчанию.
+  const msg: StatusMessenger = messenger ?? {
+    async send() { return { chatId: 0, msgId: 0 }; },
+    async edit() {},
+    async delete() {},
+  };
   // Кеш последних результатов поиска по user_id (в памяти, TTL через неактивность — для MVP достаточно)
   const lastResults = new Map<number, FlibustaBook[]>();
   // Последний запрос пользователя — чтобы перерисовать список из карточки.
@@ -107,10 +116,10 @@ export function createBotHandlers(
       await ctx.reply(`Слишком длинный запрос — ${text.length} символов. Пришли название или автора, до ${cfg.maxQueryLen} символов.`);
       return;
     }
-    // Дневной лимит поисков — защита квоты z.ai и от абьюза на публичном боте.
+    // Дневной лимит поисков — защита квоты LLM и от абьюза на публичном боте.
     // Считаем сырые поиски за скользящие 24ч. Безлимитные юзеры проходят.
     if (!unlimited(id) && analytics.countSince(id, "search", dayAgo()) >= cfg.searchDailyLimit) {
-      await ctx.reply(`Лимит поисков исчерпан: ${cfg.searchDailyLimit} за 24 часа. Попробуй через несколько часов — лимит обновляется постепенно.`);
+      await ctx.reply(`Лимит поисков исчерпан: ${cfg.searchDailyLimit} за 24 часа. Попробуй через несколько часов.`);
       return;
     }
 
@@ -122,35 +131,75 @@ export function createBotHandlers(
   }
 
   async function runSearch(ctx: HandlerCtx, id: number, text: string) {
-    // Поиск идёт несколько секунд — держим нативный индикатор «печатает»,
-    // чтобы пользователь видел, что бот работает, даже пока стоит в очереди семафора.
-    const fire = () => Promise.resolve(ctx.replyWithChatAction?.("typing")).catch(() => {});
-    await fire();
-    const typing = setInterval(fire, 4000);
+    // Ленивый статус: на быстром пути (кэш-хит / быстрый промах < 700 мс) не
+    // показываем ничего — иначе статус мерцал бы («появился → тут же список»).
+    // Один нативный typing закрывает ленивое окно до 700 мс.
+    void ctx.replyWithChatAction?.("typing").catch(() => {});
+    let ref: MsgRef | null = null;
+    let pendingSend: Promise<MsgRef> | null = null;
+    let resolved = false;
+    let currentPhase: "parsing" | "searching" = "parsing";
+    const phaseText = (p: "parsing" | "searching") =>
+      p === "parsing" ? "Разбираю запрос…" : "Ищу у себя в библиотеке…";
+
+    const lazy = setTimeout(() => {
+      if (resolved) return;
+      pendingSend = msg.send(id, phaseText(currentPhase));
+      pendingSend.then((r) => { if (!resolved) ref = r; }).catch(() => {});
+    }, 700);
+
+    // Если статус уже в полёте (send запущен, но не завершился к моменту ответа) —
+    // дождаться его и положить финальный текст в то же сообщение, а не отдельным
+    // reply. Иначе на переходном окне 700–1000 мс статус и список были бы двумя
+    // сообщениями (мерцание).
+    const ensureRef = async (): Promise<MsgRef | null> => {
+      if (ref) return ref;
+      if (pendingSend) { ref = await pendingSend.catch(() => null); return ref; }
+      return null;
+    };
+
     try {
       let books: FlibustaBook[] = [];
       let degraded = false;
+      let lowRelevance = false;
       await searchSem.acquire();
       try {
-        const r = await orchestrator.search(text, 5);
+        const r = await orchestrator.search(text, 5, (phase) => {
+          currentPhase = phase;
+          if (ref) void msg.edit(ref, phaseText(phase));
+        });
         books = r.books;
         degraded = r.degraded;
+        lowRelevance = r.lowRelevance === true;
       } finally {
         searchSem.release();
       }
+      resolved = true;
+      clearTimeout(lazy);
 
       if (!books.length) {
-        await ctx.reply(degraded ? "Ничего не нашёл (поиск без LLM). Уточни запрос." : "Ничего не нашёл. Уточни запрос.");
+        const emptyText = "К сожалению ничего не нашёл. Попробуй написать запрос точнее, добавив автора или полное название книги.";
+        const r = await ensureRef();
+        if (r) await msg.edit(r, emptyText);
+        else await ctx.reply(emptyText);
         return;
       }
       lastResults.set(id, books);
       lastQuery.set(id, text);
-      await ctx.reply(bookListText(books, text), { reply_markup: bookListKeyboard(books), parse_mode: "HTML" });
+      const r = await ensureRef();
+      // Слабое совпадение — пометка, чтобы пользователь не принял приближение за точный ответ.
+      const hint = lowRelevance ? "Я не нашёл конкретно, что ты просил, но у меня есть похожие экземпляры.\n\n" : "";
+      const listText = hint + bookListText(books, text);
+      const listExtra = { reply_markup: bookListKeyboard(books), parse_mode: "HTML" };
+      if (r) await msg.edit(r, listText, listExtra);
+      else await ctx.reply(listText, listExtra);
     } catch (e) {
+      resolved = true;
+      clearTimeout(lazy);
       console.error("search error:", (e as Error).message, "| query:", text);
-      await ctx.reply("Поиск сломался. Попробуй ещё раз.").catch(() => {});
-    } finally {
-      clearInterval(typing);
+      const r = await ensureRef();
+      if (r) await msg.edit(r, "Поиск сломался. Извините.").catch(() => {});
+      else await ctx.reply("Поиск сломался. Извините.").catch(() => {});
     }
   }
 
@@ -194,7 +243,7 @@ export function createBotHandlers(
       const filename = `${book.title}.${fmt}`.replace(/[\\/:*?"<>|]/g, "_");
       // Дневной лимит скачиваний (скользящие 24ч). Безлимитные юзеры проходят.
       if (!unlimited(id) && analytics.countSince(id, "download", dayAgo()) >= cfg.downloadDailyLimit) {
-        await ctx.reply(`Дневной лимит скачиваний исчерпан: ${cfg.downloadDailyLimit} за 24 часа. Попробуй через несколько часов — лимит обновляется постепенно.`);
+        await ctx.reply(`Дневной лимит скачиваний исчерпан: ${cfg.downloadDailyLimit} за 24 часа. Попробуй через несколько часов.`);
         return;
       }
       // Защита от повторных кликов «скачать». Два слоя:
@@ -221,28 +270,37 @@ export function createBotHandlers(
   }
 
   async function runDownload(ctx: HandlerCtx, id: number, book: FlibustaBook, url: string, filename: string, fmt: string, gkey: string) {
+    let ref: MsgRef | null = null;
     try {
       await downloadSem.acquire();
       try {
+        ref = await msg.send(id, `Скачиваю «${book.title}»…`);
         const meta = await downloader.fetchThen(url, filename, async (filePath) => {
           const { size } = await fs.stat(filePath);
+          // Перед отправкой документа меняем статус, чтобы пользователь видел
+          // переход от скачивания к отправке.
+          await msg.edit(ref!, "Отправляю…");
           // grammY требует InputFile (или строку), не «сырой» объект — иначе
           // отправка файла молча падала в catch без лога.
           await ctx.replyWithDocument(new InputFile(filePath, filename));
           return { size };
-        }, fmt);
+        }, fmt, (p) => { void msg.edit(ref!, formatProgress(p)); });
         lastDownload.set(gkey, Date.now());
         analytics.logDownload(id, {
           book_title: book.title, book_id: extractBookId(book, url),
           author: book.author, genre: book.category, format: fmt, size_bytes: meta.size,
         });
+        // Документ отправлен — статус больше не нужен, убираем.
+        await msg.delete(ref);
       } finally {
         downloadSem.release();
       }
     } catch (e) {
       // Раньше ошибка глоталась без лога — отсюда пустые логи. Теперь видно причину.
       console.error("download fail:", (e as Error).message, "| url:", url, "| fmt:", fmt, "| book:", book.title);
-      await ctx.reply("Не удалось скачать файл. Попробуй другой формат.").catch(() => {});
+      // Если статус уже отправлен — правим его на текст ошибки; иначе обычный reply.
+      if (ref) await msg.edit(ref, "Не удалось скачать. Попробуй другой формат.").catch(() => {});
+      else await ctx.reply("Не удалось скачать файл. Попробуй другой формат.").catch(() => {});
     } finally {
       inflight.delete(gkey);
     }
@@ -263,23 +321,39 @@ function extractBookId(book: FlibustaBook, url: string): number {
   return m ? Number(m[1]) : 0;
 }
 
-// Приветствие для /start и /help.
+// Байты → МБ (1024-based, 1 знак). Для прогресса скачивания.
+function mb(bytes: number): string {
+  return (bytes / 1024 / 1024).toFixed(1);
+}
+function formatProgress(p: { downloaded: number; total: number | null }): string {
+  if (p.total && p.total > 0) {
+    const pct = Math.min(100, Math.round((p.downloaded / p.total) * 100));
+    return `Скачано ${pct}% · ${mb(p.downloaded)} / ${mb(p.total)} МБ`;
+  }
+  // Content-Length неизвестен (chunked/zip) — проценты не считаем, только объём.
+  return `Скачано ${mb(p.downloaded)} МБ`;
+}
+
+// Приветствие для /start и /help. Только для allowlist-пользователей:
+// посторонним бот молчит, чтобы не раскрывать своё существование.
+// Картинка встроена в образ (assets/welcome.jpg).
+const WELCOME_IMG = "/app/assets/welcome.jpg";
 const WELCOME_TEXT = `Привет. Это бот для поиска и скачивания книг.
 
-Пришли название, автора или то и другое. Например:
+Работает он просто: пришли название книги, автора или то и другое. Например:
 • белый клык лондон
 • пелевин
 
-Получишь список книг с форматами, размером, числом скачиваний и переводчиком. Нажми номер — откроется описание, там выберешь формат для скачивания (fb2, epub, mobi, pdf, txt…).
+Получишь список книг с форматами, размером, числом скачиваний и переводом. Нажми на нужный тебе номер, и откроется описание, там выберешь формат для скачивания (fb2, epub, mobi, pdf, txt и другие).
 
-Поиск занимает несколько секунд.
+Поиск занимает 2-3 секунды.
 
 «Просвещение — это выход человека из состояния своего несовершеннолетия, в котором он находится по собственной вине».`;
 
 
 // Точка входа — собирает всё из конфига и запускает polling
 export function buildApp(cfg: Config, db: Db) {
-  const llm = createLlm({ zaiBase: cfg.zaiBase, zaiApiKey: cfg.zaiApiKey, model: cfg.model });
+  const llm = createLlm({ llmBase: cfg.llmBase, llmApiKey: cfg.llmApiKey, model: cfg.model });
   const flibusta = createFlibusta({ base: cfg.flibustaBase, fallbackBase: cfg.flibustaFallbackBase });
   const orchestrator = createOrchestrator(llm, flibusta, {
     cacheTtlSec: cfg.searchCacheTtlSec,
@@ -287,21 +361,29 @@ export function buildApp(cfg: Config, db: Db) {
   });
   const analytics = createAnalytics(db);
   const downloader = createDownloader("/tmp/flibusta-downloads");
-  const handlers = createBotHandlers(cfg, orchestrator, analytics, downloader, flibusta);
-
   const bot = new Bot(cfg.botToken);
+  // messenger берёт уже собранный bot.api: статус правит наши собственные
+  // сообщения по id через bot.api.editMessageText, а не входящее через ctx.
+  const messenger = createStatusMessenger(bot.api);
+  const handlers = createBotHandlers(cfg, orchestrator, analytics, downloader, flibusta, messenger);
   // ctx в grammY содержит токен бота. При ошибке логируем только сообщение и
   // update_id — не весь ctx, иначе токен попадает в постоянные логи.
   bot.catch((err) => {
     console.error("bot error:", err.message, "| update_id:", err.ctx?.update?.update_id);
   });
   bot.command("stats", (ctx) => handlers.onStats(ctx as unknown as HandlerCtx));
-  // /start и /help — текстовое приветствие с лимитами.
+  // /start и /help — фото с подписью, только для своих. Если фото не отправилось
+  // (например, файл пропал из образа) — падаем на текст, чтобы не терять онбординг.
   const welcome = async (c: HandlerCtx) => {
     const id = c.from?.id;
     if (!id) return;
     const text = `${WELCOME_TEXT}\n\nЛимиты: ${cfg.downloadDailyLimit} скачиваний и ${cfg.searchDailyLimit} поисков за 24 часа.`;
-    await c.reply(text);
+    try {
+      await c.replyWithPhoto(new InputFile(WELCOME_IMG), { caption: text });
+    } catch (e) {
+      console.error("welcome photo fail:", (e as Error).message);
+      await c.reply(text);
+    }
   };
   bot.command("start", (ctx) => welcome(ctx as unknown as HandlerCtx));
   bot.command("help", (ctx) => welcome(ctx as unknown as HandlerCtx));

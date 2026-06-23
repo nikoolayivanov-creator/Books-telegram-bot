@@ -37,12 +37,40 @@ export function createDownloader(tmpDir: string) {
       filename: string,
       onFile: OnFile,
       fmt?: string,
+      onProgress?: (p: { downloaded: number; total: number | null }) => void,
     ): Promise<DownloadMeta> {
       const res = await fetch(url);
       if (!res.ok || !res.body) {
         throw new Error(`скачивание не удалось: ${res.status} для ${url}`);
       }
-      let buf: Buffer = Buffer.from(await res.arrayBuffer());
+      // Стриминговое чтение вместо arrayBuffer(): считаем скачанные байты для
+      // прогресса. Content-Length бывает null при chunked/zip-ответах — тогда
+      // total остаётся null и проценты не считаются.
+      const totalRaw = res.headers.get("content-length");
+      const total = totalRaw ? Number(totalRaw) : null;
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let downloaded = 0;
+      let lastReport = Date.now();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          downloaded += value.byteLength;
+          // Троттлинг ~1 раз/с: чаще нет смысла, Telegram editMessage всё равно
+          // ограничивает, а лишние правки съедают лимит.
+          const now = Date.now();
+          if (onProgress && now - lastReport >= 1000) {
+            onProgress({ downloaded, total });
+            lastReport = now;
+          }
+        }
+      }
+      // Финальный отчёт — всегда, чтобы потребитель видел итоговое значение
+      // (на быстром пути это единственный вызов onProgress).
+      if (onProgress) onProgress({ downloaded, total });
+      let buf: Buffer = Buffer.concat(chunks);
       if (fmt && WRAP_FORMATS.has(fmt)) buf = unwrapZip(buf);
       const safeName = filename.replace(/[^\w.-]+/g, "_");
       const file = path.join(tmpDir, `${crypto.randomUUID()}-${safeName}`);

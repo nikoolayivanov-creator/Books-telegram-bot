@@ -81,6 +81,52 @@ function normalize(raw: any, base: string): FlibustaBook {
   };
 }
 
+// Локальная нормализация имени для сравнения: lowercase, убрать пунктуацию,
+// сжать пробелы. Аналог norm из orchestrator.ts, но здесь своего norm нет,
+// тянуть общую утиль ради одной функции избыточно.
+function normName(s: string): string {
+  return s.toLowerCase().replace(/[«»"'!.,?;:()\[\]]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+// Выбор автора из списка совпадений Flibusta. getAuthors возвращает несколько
+// (одфамильцы, разные переводы имени); раньше брали первого, теперь — ближайшего
+// к запрошенному. Fallback на первого сохраняет старое поведение, когда ни одно
+// имя не совпало совсем (транслитерация, опечатки) — лучше не терять поиск.
+export function chooseAuthorId(
+  requested: string,
+  authors: { id: number; name: string }[],
+): number | undefined {
+  if (!authors.length) return undefined;
+  const req = normName(requested);
+  if (!req) return authors[0].id;
+
+  const exact = authors.find((a) => normName(a.name) === req);
+  if (exact) return exact.id;
+
+  let bestInc: { id: number; len: number } | null = null;
+  for (const a of authors) {
+    const n = normName(a.name);
+    if (n && (n.includes(req) || req.includes(n))) {
+      const len = Math.min(n.length, req.length);
+      if (!bestInc || len > bestInc.len) bestInc = { id: a.id, len };
+    }
+  }
+  if (bestInc) return bestInc.id;
+
+  const reqTokens = req.split(" ").filter(Boolean);
+  let bestTok: { id: number; score: number } | null = null;
+  for (const a of authors) {
+    const n = normName(a.name);
+    if (!n) continue;
+    const nameTokens = n.split(" ").filter(Boolean);
+    const hit = reqTokens.filter((t) => nameTokens.includes(t)).length;
+    if (hit > 0 && (!bestTok || hit > bestTok.score)) bestTok = { id: a.id, score: hit };
+  }
+  if (bestTok) return bestTok.id;
+
+  return authors[0].id;
+}
+
 export function createFlibusta(deps: Deps) {
   const makeClient = (base: string) =>
     new FlibustaAPI(base, deps.httpAgent ? { httpAgent: deps.httpAgent } : undefined);
@@ -95,7 +141,7 @@ export function createFlibusta(deps: Deps) {
         for (const a of q.authors) {
           try {
             const authors = await (client as any).getAuthors(a);
-            const id = authors?.[0]?.id;
+            const id = chooseAuthorId(a, authors ?? []);
             if (id) {
               const list = await (client as any).getBooksByAuthorOpds(id);
               if (Array.isArray(list)) out.push(...list.map((r) => normalize(r, deps.base)));

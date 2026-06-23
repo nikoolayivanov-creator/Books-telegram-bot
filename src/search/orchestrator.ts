@@ -1,16 +1,22 @@
 import type { Llm } from "./llm.js";
 import type { Flibusta, FlibustaBook } from "./flibusta.js";
 
-export type SearchResult = { books: FlibustaBook[]; degraded: boolean };
+export type SearchResult = { books: FlibustaBook[]; degraded: boolean; lowRelevance?: boolean };
 
 const norm = (s: string): string =>
   s.toLowerCase().replace(/[«»"'!.,?;:()\[\]]/g, " ").replace(/\s+/g, " ").trim();
+
+// Мягкий порог релевантности. Если лучшее совпадение слабее (ни название, ни
+// автор не попали) — выдача помечается lowRelevance, бот показывает «по приближению».
+// Граница 50 выше авторских токенов (~16) и автор-includes (30) — legit-случаи
+// вроде запроса только по автору или по слову названия остаются в нормальной выдаче.
+const MIN_RELEVANCE = 50;
 
 // Детерминированная релевантность. Оцениваем не по сырому запросу, а по тому,
 // что LLM уже отделил: название (title) и авторы (authors). Иначе флексии
 // автора («джеком», «лондоном») подтягивали посторонние книги вровень с точным
 // совпадением названия. Точное совпадение названия решает однозначно.
-function relevance(pt: string, authors: string[], book: FlibustaBook): number {
+export function relevance(pt: string, authors: string[], series: string | undefined, book: FlibustaBook): number {
   const title = norm(book.title);
   const author = norm(book.author ?? "");
   let score = 0;
@@ -26,6 +32,17 @@ function relevance(pt: string, authors: string[], book: FlibustaBook): number {
     if (author.includes(an)) score += 30;
     else score += an.split(" ").filter(Boolean).filter((t) => author.includes(t)).length * 8;
   }
+  // Серия: конкретный сигнал, слабее совпадения названия, сильнее авторских
+  // токенов. Срабатывает только если LLM вытащил серию из запроса — иначе ветка
+  // пропускается и на ранг нулевой эффект (старые тесты, серия не задана).
+  if (series) {
+    const sn = norm(series);
+    const bn = norm(book.series ?? "");
+    if (sn && bn) {
+      if (bn === sn) score += 60;
+      else if (bn.includes(sn) || sn.includes(bn)) score += 30;
+    }
+  }
   return score;
 }
 
@@ -35,7 +52,7 @@ export function createOrchestrator(
   opts: { cacheTtlSec?: number; cacheMax?: number } = {},
 ) {
   // In-memory кэш результатов поиска. Одинаковые запросы разных пользователей
-  // («пелевин», «гари поттер») иначе бьют по flibusta и z.ai десятками раз.
+  // («пелевин», «гари поттер») иначе бьют по flibusta и LLM десятками раз.
   // TTL-кэш отдаёт повторный запрос без единого сетевого вызова. Ранг
   // детерминированный, книги не меняются каждую минуту — кэшировать безопасно.
   // Сбрасывается при рестарте; для поискового кэша персистентность избыточна.
@@ -64,14 +81,19 @@ export function createOrchestrator(
   };
 
   return {
-    async search(rawQuery: string, topN: number): Promise<SearchResult> {
+    async search(
+      rawQuery: string,
+      topN: number,
+      onProgress?: (phase: "parsing" | "searching") => void,
+    ): Promise<SearchResult> {
       const key = norm(rawQuery);
       const hit = cacheGet(key);
-      if (hit) return hit;
+      if (hit) return hit; // кэш-хит — onProgress не зовётся, быстрый путь без статуса
 
       let parsed;
       let degraded = false;
       try {
+        onProgress?.("parsing");
         parsed = await llm.parseQuery(rawQuery);
       } catch (e) {
         // Деградация: запрос целиком как title, без разбора. Сюда же падает
@@ -81,6 +103,7 @@ export function createOrchestrator(
         degraded = true;
       }
 
+      onProgress?.("searching");
       const raw = await flibusta.searchBooks(parsed);
       if (!raw.length) {
         // Пустой результат кэшируем — легитимное «ничего нет», спасает от
@@ -94,12 +117,17 @@ export function createOrchestrator(
       // При равной релевантности — популярное издание (больше скачиваний) выше.
       const dl = (b: FlibustaBook): number =>
         parseInt(String(b.downloadsCount ?? "").replace(/\D/g, "")) || 0;
-      const books = [...raw]
-        .map((b) => ({ b, s: relevance(pt, authors, b) }))
-        .sort((a, z) => z.s - a.s || dl(z.b) - dl(a.b))
-        .slice(0, topN)
-        .map((x) => x.b);
-      const result: SearchResult = { books, degraded };
+      const scored = [...raw]
+        .map((b) => ({ b, s: relevance(pt, authors, parsed.series, b) }))
+        .sort((a, z) => z.s - a.s || dl(z.b) - dl(a.b));
+      const books = scored.slice(0, topN).map((x) => x.b);
+      // Мягкий порог: лучшее совпадение слабое — помечаем выдачу, но книги не режем.
+      // В degraded не применяется: там title = сырой запрос, score всегда низкий.
+      const bestScore = scored[0]?.s ?? 0;
+      const lowRelevance = !degraded && bestScore < MIN_RELEVANCE;
+      const result: SearchResult = lowRelevance
+        ? { books, degraded, lowRelevance: true }
+        : { books, degraded };
       // Деградированный результат НЕ кэшируем: LLM мог отключиться временно,
       // повторный запрос через минуту должен разобраться нормально.
       if (!degraded) cachePut(key, result);

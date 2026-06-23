@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { createOrchestrator } from "../src/search/orchestrator.js";
+import { createOrchestrator, relevance } from "../src/search/orchestrator.js";
 
 const makeMocks = (books: any[]) => ({
   llm: {
@@ -81,5 +81,98 @@ describe("orchestrator", () => {
     await o.search("просто текст", 5);
     await o.search("просто текст", 5);
     expect(m.flibusta.searchBooks).toHaveBeenCalledTimes(2);
+  });
+
+  it("промах кэша: onProgress звони parsing → searching по порядку", async () => {
+    const books = [{ title: "Белый Клык", formats: ["fb2"] }];
+    const m = makeMocks(books);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    const phases: string[] = [];
+    await o.search("белый клык", 5, (p) => phases.push(p));
+    expect(phases).toEqual(["parsing", "searching"]);
+  });
+
+  it("кэш-хит: onProgress не звони ни разу", async () => {
+    const books = [{ title: "Белый Клык", formats: ["fb2"] }];
+    const m = makeMocks(books);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("белый клык", 5); // прогрев кэша
+    const phases: string[] = [];
+    await o.search("белый клык", 5, (p) => phases.push(p));
+    expect(phases).toEqual([]);
+  });
+});
+
+describe("relevance: серия", () => {
+  it("бонус +60 за точное совпадение серии", () => {
+    const base = relevance("белый клык", [], undefined, { title: "Белый Клык" } as any);
+    const scored = relevance("белый клык", [], "детство", { title: "Белый Клык", series: "Детство" } as any);
+    expect(scored - base).toBe(60);
+  });
+
+  it("бонус +30 за частичное совпадение серии (включение)", () => {
+    const base = relevance("белый клык", [], "песнь льда", { title: "Белый Клык" } as any);
+    const scored = relevance("белый клык", [], "песнь льда", { title: "Белый Клык", series: "Песнь льда и пламени" } as any);
+    expect(scored - base).toBe(30);
+  });
+
+  it("точное совпадение названия доминирует над серией конкурента", () => {
+    const series = "песнь льда и пламени";
+    // A: точное название, чужая серия
+    const a = relevance("игра престолов", [], series, { title: "Игра престолов", series: "Другая" } as any);
+    // B: неточное название, но нужная серия
+    const b = relevance("игра престолов", [], series, { title: "Игра", series: "Песнь льда и пламени" } as any);
+    expect(a).toBeGreaterThan(b);
+  });
+
+  it("серия не учитывается, если в запросе её не задали", () => {
+    const withSeries = relevance("белый клык", [], undefined, { title: "Белый Клык", series: "Детство" } as any);
+    const noSeries = relevance("белый клык", [], undefined, { title: "Белый Клык" } as any);
+    expect(withSeries).toBe(noSeries);
+  });
+});
+
+describe("порог lowRelevance", () => {
+  it("слабое совпадение (не degraded) → lowRelevance: true, книги не пусты", async () => {
+    const books = [{ title: "abc", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ title: "xyz" }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    const r = await o.search("запрос", 5);
+    expect(r.lowRelevance).toBe(true);
+    expect(r.books.length).toBeGreaterThan(0);
+  });
+
+  it("сильное совпадение → lowRelevance falsy", async () => {
+    const books = [{ title: "Белый Клык", author: "Лондон Джек", formats: ["fb2"] }];
+    const m = makeMocks(books);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    const r = await o.search("белый клык", 5);
+    expect(r.lowRelevance).toBeFalsy();
+  });
+
+  it("degraded → порог не применяется (lowRelevance falsy)", async () => {
+    const books = [{ title: "X", formats: ["fb2"] }];
+    const m = makeMocks(books);
+    m.llm.parseQuery.mockRejectedValue(new Error("llm down"));
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    const r = await o.search("просто текст", 5);
+    expect(r.degraded).toBe(true);
+    expect(r.lowRelevance).toBeFalsy();
+    expect(r.books.length).toBeGreaterThan(0);
+  });
+
+  it("lowRelevance-результат кэшируется (повтор не бьёт в flibusta)", async () => {
+    const books = [{ title: "abc", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ title: "xyz" }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("запрос", 5);
+    await o.search("запрос", 5);
+    expect(m.flibusta.searchBooks).toHaveBeenCalledTimes(1);
   });
 });

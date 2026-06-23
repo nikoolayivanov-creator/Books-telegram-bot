@@ -11,9 +11,9 @@ describe("loadConfig", () => {
       BOT_TOKEN: "123:abc",
       ALLOWED_IDS: "111,222",
       ADMIN_IDS: "111",
-      ZAI_API_KEY: "key",
-      ZAI_BASE: "https://api.z.ai/api/paas/v4",
-      MODEL: "glm-4.5-air",
+      LLM_API_KEY: "key",
+      LLM_BASE: "https://openai.bothub.chat/v1",
+      MODEL: "gpt-4o-mini",
       FLIBUSTA_BASE: "https://flibusta.is",
       RATE_LIMIT_PER_MIN: "20",
     });
@@ -32,7 +32,7 @@ describe("loadConfig", () => {
   it("applies defaults for optional fields", () => {
     Object.assign(process.env, {
       BOT_TOKEN: "t", ALLOWED_IDS: "1", ADMIN_IDS: "1",
-      ZAI_API_KEY: "k", ZAI_BASE: "https://api.z.ai", MODEL: "m", FLIBUSTA_BASE: "https://flibusta.is",
+      LLM_API_KEY: "k", LLM_BASE: "https://openai.bothub.chat/v1", MODEL: "m", FLIBUSTA_BASE: "https://flibusta.is",
     });
     const cfg = loadConfig();
     expect(cfg.rateLimitPerMin).toBe(20);

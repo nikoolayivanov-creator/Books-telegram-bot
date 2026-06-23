@@ -7,7 +7,45 @@ vi.mock("flibusta", () => {
 });
 
 import FlibustaAPI from "flibusta";
-import { createFlibusta } from "../src/search/flibusta.js";
+import { createFlibusta, chooseAuthorId } from "../src/search/flibusta.js";
+
+describe("chooseAuthorId", () => {
+  it("точное совпадение имени предпочтительнее первого в списке", () => {
+    const id = chooseAuthorId("Джек Лондон", [
+      { id: 1, name: "Джон Лондон" },
+      { id: 2, name: "Джек Лондон" },
+    ]);
+    expect(id).toBe(2);
+  });
+
+  it("совпадение по включению, если точного нет", () => {
+    const id = chooseAuthorId("Лондон", [
+      { id: 1, name: "Лондон Джек" },
+      { id: 2, name: "Джон Смит" },
+    ]);
+    expect(id).toBe(1);
+  });
+
+  it("fallback на первого, если ничего не совпало (старое поведение)", () => {
+    const id = chooseAuthorId("Абракадабра", [
+      { id: 1, name: "Кто-то" },
+      { id: 2, name: "Другой" },
+    ]);
+    expect(id).toBe(1);
+  });
+
+  it("пустой список → undefined", () => {
+    expect(chooseAuthorId("X", [])).toBeUndefined();
+  });
+
+  it("по токенам, когда слова те же, но в другом порядке (ни точного, ни включения)", () => {
+    const id = chooseAuthorId("джек лондон", [
+      { id: 1, name: "другой писатель" },
+      { id: 2, name: "лондон джек писатель" },
+    ]);
+    expect(id).toBe(2);
+  });
+});
 
 describe("flibusta wrapper", () => {
   afterEach(() => vi.clearAllMocks());

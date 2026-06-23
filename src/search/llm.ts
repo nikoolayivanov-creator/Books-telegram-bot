@@ -9,7 +9,7 @@ export type ParsedQuery = {
 
 export type BookLite = { title: string; author?: string };
 
-type LlmDeps = { zaiBase: string; zaiApiKey: string; model: string };
+type LlmDeps = { llmBase: string; llmApiKey: string; model: string };
 
 // LLM возвращает JSON, но не гарантирует схему — валидируем рантаймом.
 const ParsedQuerySchema = z.object({
@@ -23,45 +23,65 @@ const RankSchema = z.object({
   ranking: z.array(z.number()).optional(),
 });
 
-const PARSE_PROMPT = `Ты парсер поискового запроса к библиотеке.
-верни ТОЛЬКО JSON без пояснений: {"authors":["..."], "title":"...", "series":"...", "genre":"..."}.
-Поля опускай если их нет в запросе. Нормализуй опечатки в именах авторов.
-Запрос: `;
+export const PARSE_PROMPT = `Ты парсер поискового запроса к библиотеке.
+Верни ТОЛЬКО JSON без пояснений: {"authors":["..."], "title":"...", "series":"...", "genre":"..."}.
+Поля опускай, если их нет в запросе. Нормализуй опечатки в именах авторов и в названии книги (например «гари потер» → «Гарри Поттер»). Серию («Песнь льда и пламени», «Сумерки») выноси в поле series, не включай её в title. genre — только если пользователь явно указал жанр.`;
+
+// few-shot: примеры разбора. Учим разделять автора/название, править опечатки
+// в названии и выносить серию. Turn-ы user/assistant вставляются между system
+// и финальным запросом — канонический способ, надёжнее вписывания примеров в system.
+export const FEW_SHOT: readonly { user: string; assistant: string }[] = [
+  { user: "пелевин чапаев и пустота", assistant: '{"authors":["Пелевин"],"title":"Чапаев и Пустота"}' },
+  { user: "гари потер и филосовский камень роулинг", assistant: '{"authors":["Роулинг"],"title":"Гарри Поттер и философский камень"}' },
+  { user: "стругацкие пикник на обочине", assistant: '{"authors":["Стругацкие"],"title":"Пикник на обочине"}' },
+  { user: "джордж мартин игра престолов песнь льда и пламени", assistant: '{"authors":["Мартин"],"title":"Игра престолов","series":"Песнь льда и пламени"}' },
+];
 
 const RANK_PROMPT = `Ты ранжируешь результаты поиска книг по релевантности запросу.
 Дан запрос и список книг (title + author). Верни ТОЛЬКО JSON: {"ranking":[индексы от наиболее релевантного]}.
 Индексы — позиции в массиве (0-based). Без дубликатов.`;
 
-// Жёсткий потолок одного LLM-вызова. Thinking выключен, норма 2-3с; z.ai изредка
-// зависает — без таймаута пользователь ждёт минутами. По превышению throw →
-// orchestrator уходит в degraded-поиск (без LLM).
+// Жёсткий потолок одного LLM-вызова. Reasoning выключен, норма 2-3с; апстрим
+// изредка зависает — без таймаута пользователь ждёт минутами. По превышению
+// throw → orchestrator уходит в degraded-поиск (без LLM).
 const LLM_TIMEOUT_MS = 15_000;
 
 export function createLlm(deps: LlmDeps) {
-  async function complete(system: string, user: string): Promise<string> {
-    const res = await fetch(`${deps.zaiBase}/chat/completions`, {
+  async function complete(
+    system: string,
+    user: string,
+    fewShot?: readonly { user: string; assistant: string }[],
+  ): Promise<string> {
+    const messages: { role: string; content: string }[] = [
+      { role: "system", content: system },
+    ];
+    if (fewShot) {
+      for (const ex of fewShot) {
+        messages.push({ role: "user", content: ex.user });
+        messages.push({ role: "assistant", content: ex.assistant });
+      }
+    }
+    messages.push({ role: "user", content: user });
+    const res = await fetch(`${deps.llmBase}/chat/completions`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        authorization: `Bearer ${deps.zaiApiKey}`,
+        authorization: `Bearer ${deps.llmApiKey}`,
       },
       body: JSON.stringify({
         model: deps.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
+        messages,
         temperature: 0,
         max_tokens: 1024,
-        // GLM-4.5 включает thinking по умолчанию — ради парсинга одной строки в
-        // JSON модель «размышляла» ~4-5с. Выключаем: запрос падает с ~6с до ~2-3с.
-        thinking: { type: "disabled" },
+        // reasoning-модели думают по умолчанию и съедают бюджет токенов ради
+        // парсинга одной строки. Выключаем (OpenAI-стиль, bothub): ~6с → ~2-3с.
+        reasoning_effort: "none",
       }),
-      // Жёсткий потолок вызова. При зависании z.ai abort → throw → orchestrator
-      // уходит в degraded-поиск (без LLM), вместо минут ожидания.
+      // Жёсткий потолок вызова. При зависании апстрима abort → throw →
+      // orchestrator уходит в degraded-поиск (без LLM), вместо минут ожидания.
       signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
     });
-    if (!res.ok) throw new Error(`z.ai ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(`llm ${res.status}: ${await res.text()}`);
     const data = (await res.json()) as {
       choices: { message: { content: string } }[];
     };
@@ -81,7 +101,7 @@ export function createLlm(deps: LlmDeps) {
 
   return {
     async parseQuery(raw: string): Promise<ParsedQuery> {
-      const out = await complete(PARSE_PROMPT, raw);
+      const out = await complete(PARSE_PROMPT, `Запрос: ${raw}`, FEW_SHOT);
       const parsed = ParsedQuerySchema.safeParse(extractJson(out));
       return parsed.success ? parsed.data : {};
     },

@@ -15,7 +15,7 @@ const fmtNum = (s: string): string => s.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
 export function bookListText(books: FlibustaBook[], query?: string): string {
   const header = query ? `Найдено по запросу «${esc(query)}»:` : "Что нашёл:";
   const items = books.map((b, i) => listItem(i + 1, b));
-  return [header, "", items.join("\n\n"), "", "<i>Нажми номер, чтобы открыть книгу и скачать.</i>"].join("\n");
+  return [header, "", items.join("\n\n"), "", "<i>Нажми номер, чтобы скачать.</i>"].join("\n");
 }
 
 function listItem(n: number, b: FlibustaBook): string {

@@ -56,4 +56,20 @@ describe("downloader", () => {
     await d.fetchThen("https://flibusta.is/b/1/epub", "Книга.epub", onFile, "epub");
     expect(got[0]).toBe(0x50); // PK — zip сохранён как есть
   });
+
+  it("сообщает прогресс скачивания (total null без content-length)", async () => {
+    // new Response(body) не выставляет content-length → total должен быть null.
+    global.fetch = vi.fn(async () =>
+      new Response(Buffer.from([1, 2, 3, 4, 5]), { status: 200 })
+    ) as any;
+    const seen: { downloaded: number; total: number | null }[] = [];
+    const d = createDownloader(tmp);
+    await d.fetchThen(
+      "https://x/b/1/fb2", "b.fb2", async () => ({ size: 5 }),
+      undefined, (p) => seen.push(p),
+    );
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    // Финальный отчёт: все 5 байт, total null.
+    expect(seen.at(-1)).toEqual({ downloaded: 5, total: null });
+  });
 });

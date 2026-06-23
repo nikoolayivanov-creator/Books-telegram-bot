@@ -27,6 +27,11 @@ const mkDownloader = () => ({
 const mkFlibusta = () => ({
   searchBooks: vi.fn(), downloadUrl: vi.fn().mockReturnValue("https://flibusta.is/b/1/fb2"),
 });
+const mkMessenger = () => ({
+  send: vi.fn().mockResolvedValue({ chatId: 111, msgId: 500 }),
+  edit: vi.fn().mockResolvedValue(undefined),
+  delete: vi.fn().mockResolvedValue(undefined),
+});
 
 function mkCtx(extra: any = {}) {
   return {
@@ -77,7 +82,7 @@ describe("bot handlers", () => {
     const ctx = mkCtx({ from: { id: 222 } });
     await h.onText(ctx);
     await h.idle();
-    expect(o.search).toHaveBeenCalledWith("конан дойл шерлок", expect.any(Number));
+    expect(o.search).toHaveBeenCalledWith("конан дойл шерлок", expect.any(Number), expect.any(Function));
   });
 
   it("onFmtCallback: блокирует скачивание при дневном лимите", async () => {
@@ -101,7 +106,7 @@ describe("bot handlers", () => {
     const ctx = mkCtx();
     await h.onText(ctx);
     await h.idle();
-    expect(o.search).toHaveBeenCalledWith("конан дойл шерлок", expect.any(Number));
+    expect(o.search).toHaveBeenCalledWith("конан дойл шерлок", expect.any(Number), expect.any(Function));
     expect(a.logSearch).toHaveBeenCalledWith(111, "конан дойл шерлок");
     expect(ctx.reply).toHaveBeenCalled();
   });
@@ -193,5 +198,105 @@ describe("bot handlers", () => {
     expect(o.search).not.toHaveBeenCalled();
     expect(a.logSearch).not.toHaveBeenCalled();
     expect(ctx.reply).toHaveBeenCalled();
+  });
+
+  it("runDownload: send → edit(прогресс) → edit(Отправляю) → delete на успехе", async () => {
+    const books = [{ title: "Шерлок", author: "Конан Дойль", book_id: 1, formats: ["fb2"], downloads: [{ link: "/b/1/fb2", format: "fb2" }] }];
+    const m = mkMessenger();
+    // downloader, который реально дёргает onProgress с растущим downloaded.
+    const d = {
+      fetchThen: vi.fn().mockImplementation(async (_url: string, _filename: string, onf: any, _fmt: string, onProgress: any) => {
+        onProgress?.({ downloaded: 3, total: 5 });
+        onProgress?.({ downloaded: 5, total: 5 });
+        const fs = await import("node:fs/promises");
+        const f = "./tmp-fake-test-file.fb2";
+        await fs.writeFile(f, "x");
+        try { await onf(f); } finally { await fs.unlink(f).catch(() => {}); }
+        return { size: 5 };
+      }),
+    };
+    const h = createBotHandlers(cfg as any, mkOrchestrator(books) as any, mkAnalytics() as any, d as any, mkFlibusta() as any, m as any);
+    (h as any).lastResults.set(111, books);
+    const ctx = mkCtx({ callbackQuery: { data: "fmt:0:fb2" } });
+    await h.onCallback(ctx);
+    await h.idle();
+    expect(m.send).toHaveBeenCalledWith(111, expect.stringContaining("Шерлок"));
+    // прогресс правит статус на «Скачано …%»
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, expect.stringMatching(/^Скачано \d+% /));
+    // перед отправкой документа — «Отправляю…»
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, "Отправляю…");
+    expect(ctx.replyWithDocument).toHaveBeenCalled();
+    // успех — статус удалён
+    expect(m.delete).toHaveBeenCalledWith({ chatId: 111, msgId: 500 });
+  });
+
+  it("runDownload: на ошибке правит статус на текст ошибки (без delete)", async () => {
+    const books = [{ title: "Шерлок", book_id: 1, formats: ["fb2"], downloads: [{ link: "/b/1/fb2", format: "fb2" }] }];
+    const m = mkMessenger();
+    const d = { fetchThen: vi.fn().mockRejectedValue(new Error("upstream 500")) };
+    const h = createBotHandlers(cfg as any, mkOrchestrator(books) as any, mkAnalytics() as any, d as any, mkFlibusta() as any, m as any);
+    (h as any).lastResults.set(111, books);
+    const ctx = mkCtx({ callbackQuery: { data: "fmt:0:fb2" } });
+    await h.onCallback(ctx);
+    await h.idle();
+    expect(m.send).toHaveBeenCalled();
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, "Не удалось скачать. Попробуй другой формат.");
+    expect(m.delete).not.toHaveBeenCalled();
+    expect(ctx.replyWithDocument).not.toHaveBeenCalled();
+  });
+
+  it("runSearch: быстрый путь (кэш/быстрый промах) — без статус-сообщения, только reply", async () => {
+    const books = [{ title: "Шерлок", author: "Конан Дойль", formats: ["fb2"], downloads: [] }];
+    const m = mkMessenger();
+    const o = mkOrchestrator(books); // резолвится мгновенно — lazy-таймер не успевает
+    const h = createBotHandlers(cfg as any, o as any, mkAnalytics() as any, mkDownloader() as any, mkFlibusta() as any, m as any);
+    const ctx = mkCtx();
+    await h.onText(ctx);
+    await h.idle();
+    expect(m.send).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalled();
+  });
+
+  it("runSearch: медленный путь — send статуса, edit на смену фазы, финальный edit списком", async () => {
+    const books = [{ title: "Шерлок", author: "Конан Дойль", formats: ["fb2"], downloads: [] }];
+    const m = mkMessenger();
+    const o = {
+      search: vi.fn().mockImplementation(async (_q: string, _n: number, onProgress: any) => {
+        onProgress?.("parsing");
+        await new Promise((r) => setTimeout(r, 750)); // > 700 мс → lazy-статус создаётся
+        onProgress?.("searching");
+        return { books, degraded: false };
+      }),
+    };
+    const h = createBotHandlers(cfg as any, o as any, mkAnalytics() as any, mkDownloader() as any, mkFlibusta() as any, m as any);
+    const ctx = mkCtx();
+    await h.onText(ctx);
+    await h.idle();
+    // статус создан с первой фазой
+    expect(m.send).toHaveBeenCalledWith(111, "Разбираю запрос…");
+    // смена фазы правит статус
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, "Ищу у себя в библиотеке…");
+    // финальный edit заменяет статус на список книг (с клавиатурой)
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, expect.any(String), expect.objectContaining({ parse_mode: "HTML" }));
+    // отдельного reply нет — список лёг в то же сообщение
+    expect(ctx.reply).not.toHaveBeenCalled();
+  });
+
+  it("runSearch: lowRelevance → пометка «по приближению» в выдаче", async () => {
+    const books = [{ title: "Чужая Книга", author: "Неизвестный", formats: ["fb2"], downloads: [] }];
+    const m = mkMessenger();
+    const o = {
+      search: vi.fn().mockImplementation(async (_q: string, _n: number, onProgress: any) => {
+        onProgress?.("parsing");
+        await new Promise((r) => setTimeout(r, 750));
+        onProgress?.("searching");
+        return { books, degraded: false, lowRelevance: true };
+      }),
+    };
+    const h = createBotHandlers(cfg as any, o as any, mkAnalytics() as any, mkDownloader() as any, mkFlibusta() as any, m as any);
+    const ctx = mkCtx();
+    await h.onText(ctx);
+    await h.idle();
+    expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, expect.stringContaining("похожие"), expect.objectContaining({ parse_mode: "HTML" }));
   });
 });
