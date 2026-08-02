@@ -6,7 +6,7 @@ const makeMocks = (books: any[]) => ({
     parseQuery: vi.fn().mockResolvedValue({ authors: ["джек лондон"], title: "белый клык" }),
     rankBooks: vi.fn(),
   },
-  flibusta: { searchBooks: vi.fn().mockResolvedValue(books) },
+  flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
 });
 
 describe("orchestrator", () => {
@@ -137,7 +137,7 @@ describe("порог lowRelevance", () => {
     const books = [{ title: "abc", formats: ["fb2"] }];
     const m = {
       llm: { parseQuery: vi.fn().mockResolvedValue({ title: "xyz" }), rankBooks: vi.fn() },
-      flibusta: { searchBooks: vi.fn().mockResolvedValue(books) },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
     };
     const o = createOrchestrator(m.llm as any, m.flibusta as any);
     const r = await o.search("запрос", 5);
@@ -168,7 +168,7 @@ describe("порог lowRelevance", () => {
     const books = [{ title: "abc", formats: ["fb2"] }];
     const m = {
       llm: { parseQuery: vi.fn().mockResolvedValue({ title: "xyz" }), rankBooks: vi.fn() },
-      flibusta: { searchBooks: vi.fn().mockResolvedValue(books) },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
     };
     const o = createOrchestrator(m.llm as any, m.flibusta as any);
     await o.search("запрос", 5);

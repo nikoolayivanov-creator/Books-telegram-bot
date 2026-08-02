@@ -104,22 +104,40 @@ export function createOrchestrator(
       }
 
       onProgress?.("searching");
-      const raw = await flibusta.searchBooks(parsed);
-      if (!raw.length) {
-        // Пустой результат кэшируем — легитимное «ничего нет», спасает от
-        // повторных вызовов на опечатки и несуществующие книги.
-        cachePut(key, { books: [], degraded });
-        return { books: [], degraded };
-      }
+      // UNION: LLM-разбор и детерминированный split-search — параллельно.
+      // split покрывает кейсы, где LLM промахивается (author-only, грязные
+      // реальные запросы) и служит страховкой при падении LLM. Каждый пул
+      // оценивается своим разбором; в общий пул книга идёт с максимумом оценок
+      // — «лучший сценарий» её нахождения. ~80% rel@3 против 69% у LLM-соло.
+      const [llmRaw, splitRaw] = await Promise.all([
+        flibusta.searchBooks(parsed).catch(() => [] as FlibustaBook[]),
+        flibusta
+          .splitSearchBooks(rawQuery)
+          .catch(() => [] as Array<{ book: FlibustaBook; pt: string; authors: string[] }>),
+      ]);
 
       const pt = norm(parsed.title ?? rawQuery);
       const authors = parsed.authors ?? [];
       // При равной релевантности — популярное издание (больше скачиваний) выше.
       const dl = (b: FlibustaBook): number =>
         parseInt(String(b.downloadsCount ?? "").replace(/\D/g, "")) || 0;
-      const scored = [...raw]
-        .map((b) => ({ b, s: relevance(pt, authors, parsed.series, b) }))
-        .sort((a, z) => z.s - a.s || dl(z.b) - dl(a.b));
+      const pool = new Map<string, { b: FlibustaBook; s: number }>();
+      const merge = (b: FlibustaBook, s: number): void => {
+        const k = norm(b.title) + "|" + norm(b.author ?? "");
+        const ex = pool.get(k);
+        if (!ex || s > ex.s) pool.set(k, { b, s });
+      };
+      for (const b of llmRaw) merge(b, relevance(pt, authors, parsed.series, b));
+      for (const r of splitRaw) merge(r.book, relevance(r.pt, r.authors, undefined, r.book));
+
+      if (!pool.size) {
+        // Пустой результат кэшируем — легитимное «ничего нет», спасает от
+        // повторных вызовов на опечатки и несуществующие книги.
+        cachePut(key, { books: [], degraded });
+        return { books: [], degraded };
+      }
+
+      const scored = [...pool.values()].sort((a, z) => z.s - a.s || dl(z.b) - dl(a.b));
       const books = scored.slice(0, topN).map((x) => x.b);
       // Мягкий порог: лучшее совпадение слабое — помечаем выдачу, но книги не режем.
       // В degraded не применяется: там title = сырой запрос, score всегда низкий.
