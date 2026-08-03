@@ -61,6 +61,9 @@ export function createBotHandlers(
   const lastResults = new Map<number, FlibustaBook[]>();
   // Последний запрос пользователя — чтобы перерисовать список из карточки.
   const lastQuery = new Map<number, string>();
+  // Текущая страница списка (пагинация по 5, до 3 стр) — «Назад к списку»
+  // возвращает пользователя на ту страницу, где он был, а не на первую.
+  const lastPage = new Map<number, number>();
   // Rate limit в памяти. Отклонение от спеки (там был SQLite): для скользящего окна 60с
   // персистентность избыточна. При росте >100 юзеров перенести в db.countEventsSince.
   const hits = new Map<number, number[]>();
@@ -164,7 +167,7 @@ export function createBotHandlers(
       let lowRelevance = false;
       await searchSem.acquire();
       try {
-        const r = await orchestrator.search(text, 5, (phase) => {
+        const r = await orchestrator.search(text, 15, (phase) => {
           currentPhase = phase;
           if (ref) void msg.edit(ref, phaseText(phase));
         });
@@ -186,11 +189,12 @@ export function createBotHandlers(
       }
       lastResults.set(id, books);
       lastQuery.set(id, text);
+      lastPage.set(id, 0);
       const r = await ensureRef();
       // Слабое совпадение — пометка, чтобы пользователь не принял приближение за точный ответ.
       const hint = lowRelevance ? "Я не нашёл конкретно, что ты просил, но у меня есть похожие экземпляры.\n\n" : "";
-      const listText = hint + bookListText(books, text);
-      const listExtra = { reply_markup: bookListKeyboard(books), parse_mode: "HTML" };
+      const listText = hint + bookListText(books, text, 0);
+      const listExtra = { reply_markup: bookListKeyboard(books, 0), parse_mode: "HTML" };
       if (r) await msg.edit(r, listText, listExtra);
       else await ctx.reply(listText, listExtra);
     } catch (e) {
@@ -210,7 +214,23 @@ export function createBotHandlers(
     const results = lastResults.get(id) ?? [];
 
     if (data === "list") {
-      await ctx.editMessageText(bookListText(results, lastQuery.get(id)), { reply_markup: bookListKeyboard(results), parse_mode: "HTML" });
+      const page = lastPage.get(id) ?? 0;
+      await ctx.editMessageText(bookListText(results, lastQuery.get(id), page), { reply_markup: bookListKeyboard(results, page), parse_mode: "HTML" });
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    if (data.startsWith("page:")) {
+      const page = Number(data.slice(5));
+      const pages = Math.min(3, Math.ceil(results.length / 5));
+      await ctx.answerCallbackQuery();
+      if (Number.isNaN(page) || page < 0 || page >= pages) return;
+      lastPage.set(id, page);
+      await ctx.editMessageText(bookListText(results, lastQuery.get(id), page), { reply_markup: bookListKeyboard(results, page), parse_mode: "HTML" });
+      return;
+    }
+
+    if (data === "noop") {
       await ctx.answerCallbackQuery();
       return;
     }
@@ -360,7 +380,7 @@ export function buildApp(cfg: Config, db: Db) {
     cacheMax: cfg.searchCacheMax,
   });
   const analytics = createAnalytics(db);
-  const downloader = createDownloader("/tmp/flibusta-downloads");
+  const downloader = createDownloader("/tmp/book-search-downloads");
   const bot = new Bot(cfg.botToken);
   // messenger берёт уже собранный bot.api: статус правит наши собственные
   // сообщения по id через bot.api.editMessageText, а не входящее через ctx.

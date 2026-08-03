@@ -10,12 +10,24 @@ const esc = (s: string): string =>
 // «15349» → «15 349» — разделитель разрядов, удобнее сравнивать популярность.
 const fmtNum = (s: string): string => s.replace(/\B(?=(\d{3})+(?!\d))/g, " ");
 
+// Пагинация: 5 книг на странице, до 3 страниц (топ-15). Сквозная нумерация —
+// книга №7 на странице 2 остаётся №7, однозначно сопоставлена с book-индексом.
+const PER_PAGE = 5;
+const MAX_PAGES = 3;
+
 // Текст ранжированного списка с контрастом: жирный заголовок-якорь,
 // жирное число скачиваний (метрика «какая лучше»), курсив — переводчик/серия.
-export function bookListText(books: FlibustaBook[], query?: string): string {
+export function bookListText(books: FlibustaBook[], query?: string, page = 0): string {
+  const start = page * PER_PAGE;
+  const slice = books.slice(start, start + PER_PAGE);
   const header = query ? `Найдено по запросу «${esc(query)}»:` : "Что нашёл:";
-  const items = books.map((b, i) => listItem(i + 1, b));
-  return [header, "", items.join("\n\n"), "", "<i>Нажми номер, чтобы скачать.</i>"].join("\n");
+  const items = slice.map((b, i) => listItem(start + i + 1, b));
+  const pages = Math.min(MAX_PAGES, Math.ceil(books.length / PER_PAGE));
+  const footer =
+    pages > 1
+      ? `\n\nСтраница ${page + 1} из ${pages}. Нажми номер, чтобы скачать.`
+      : "\n\n<i>Нажми номер, чтобы скачать.</i>";
+  return [header, "", items.join("\n\n"), footer].join("\n");
 }
 
 function listItem(n: number, b: FlibustaBook): string {
@@ -50,10 +62,19 @@ export function bookCardText(b: FlibustaBook): string {
   return lines.join("\n");
 }
 
-// Кнопки-номера: однозначно сопоставлены со списком выше.
-export function bookListKeyboard(books: FlibustaBook[]): InlineKeyboard {
+// Кнопки-номера (сквозные, book:globalIdx) + навигация по страницам.
+export function bookListKeyboard(books: FlibustaBook[], page = 0): InlineKeyboard {
   const kb = new InlineKeyboard();
-  books.forEach((_b, i) => kb.text(String(i + 1), `book:${i}`));
+  const start = page * PER_PAGE;
+  const slice = books.slice(start, start + PER_PAGE);
+  slice.forEach((_b, i) => kb.text(String(start + i + 1), `book:${start + i}`));
+  const pages = Math.min(MAX_PAGES, Math.ceil(books.length / PER_PAGE));
+  if (pages > 1) {
+    kb.row();
+    if (page > 0) kb.text("‹ Назад", `page:${page - 1}`);
+    kb.text(`${page + 1}/${pages}`, "noop");
+    if (page < pages - 1) kb.text("Вперёд ›", `page:${page + 1}`);
+  }
   return kb;
 }
 
