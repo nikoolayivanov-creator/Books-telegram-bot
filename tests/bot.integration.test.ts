@@ -262,9 +262,9 @@ describe("bot handlers", () => {
     const m = mkMessenger();
     const o = {
       search: vi.fn().mockImplementation(async (_q: string, _n: number, onProgress: any) => {
-        onProgress?.("parsing");
+        onProgress?.({ kind: "parsing" });
         await new Promise((r) => setTimeout(r, 750)); // > 700 мс → lazy-статус создаётся
-        onProgress?.("searching");
+        onProgress?.({ kind: "searching" });
         return { books, degraded: false };
       }),
     };
@@ -287,9 +287,9 @@ describe("bot handlers", () => {
     const m = mkMessenger();
     const o = {
       search: vi.fn().mockImplementation(async (_q: string, _n: number, onProgress: any) => {
-        onProgress?.("parsing");
+        onProgress?.({ kind: "parsing" });
         await new Promise((r) => setTimeout(r, 750));
-        onProgress?.("searching");
+        onProgress?.({ kind: "searching" });
         return { books, degraded: false, lowRelevance: true };
       }),
     };
@@ -298,5 +298,34 @@ describe("bot handlers", () => {
     await h.onText(ctx);
     await h.idle();
     expect(m.edit).toHaveBeenCalledWith({ chatId: 111, msgId: 500 }, expect.stringContaining("похожие"), expect.objectContaining({ parse_mode: "HTML" }));
+  });
+
+  it("runSearch: новый запрос обгоняет висящий старый — lastResults за новым, статус старого удалён", async () => {
+    const booksA = [{ title: "Книга А", author: "Автор А", formats: ["fb2"], downloads: [] }];
+    const booksB = [{ title: "Книга Б", author: "Автор Б", formats: ["fb2"], downloads: [] }];
+    const m = mkMessenger();
+    const o = {
+      search: vi.fn().mockImplementation(async (q: string, _n: number, onProgress: any) => {
+        onProgress?.({ kind: "parsing" });
+        // A висит дольше lazy-окна (700 мс) — успевает создать статус-сообщение;
+        // B завершается быстро и обгоняет. Воспроизводит баг «книги заменились
+        // на предыдущий»: без race-защиты A затёр бы lastResults своим списком.
+        if (q.includes("медленный")) await new Promise((r) => setTimeout(r, 900));
+        else await new Promise((r) => setTimeout(r, 50));
+        onProgress?.({ kind: "searching" });
+        return { books: q.includes("медленный") ? booksA : booksB, degraded: false };
+      }),
+    };
+    const h = createBotHandlers(cfg as any, o as any, mkAnalytics() as any, mkDownloader() as any, mkFlibusta() as any, m as any);
+    const ctxA = mkCtx({ message: { text: "медленный запрос" } });
+    const ctxB = mkCtx({ message: { text: "быстрый запрос" } });
+    h.onText(ctxA); // A в фоне
+    await new Promise((r) => setTimeout(r, 120)); // B стартует, когда A уже висит
+    h.onText(ctxB); // B обгонит
+    await h.idle(); // дождаться обоих
+    // последний результат — за новым запросом B; старый A выброшен race-защитой
+    expect(h.lastResults.get(111)).toBe(booksB);
+    // статус-сообщение висящего старого запроса удалено, а не «ожило» старым списком
+    expect(m.delete).toHaveBeenCalledWith({ chatId: 111, msgId: 500 });
   });
 });

@@ -3,7 +3,7 @@ import { createDb } from "./db.js";
 import { buildApp } from "./bot.js";
 
 const cfg = loadConfig();
-const db = createDb("/data/flibusta-bot.db");
+const db = createDb("/data/book-search-bot.db");
 
 if (cfg.logTtlDays) {
   const day = 86400;
@@ -22,5 +22,5 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 bot.start({
-  onStart: () => console.log("flibusta-bot started"),
+  onStart: () => console.log("book-search-bot started"),
 });

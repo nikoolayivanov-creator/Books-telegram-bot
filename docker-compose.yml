@@ -6,6 +6,7 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      - ./logs:/logs
     tmpfs:
       - /tmp/flibusta-downloads:size=200M
     logging:

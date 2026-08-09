@@ -4,12 +4,13 @@ import type { Analytics } from "./analytics.js";
 import { createAnalytics } from "./analytics.js";
 import fs from "node:fs/promises";
 import type { Db } from "./db.js";
-import { createOrchestrator } from "./search/orchestrator.js";
+import { createOrchestrator, type SearchProgress } from "./search/orchestrator.js";
 import { createLlm } from "./search/llm.js";
 import { createFlibusta, type Flibusta, type FlibustaBook } from "./search/flibusta.js";
 import { createDownloader } from "./download.js";
 import { bookListKeyboard, formatsKeyboard, bookListText, bookCardText } from "./keyboards.js";
 import { createStatusMessenger, type StatusMessenger, type MsgRef } from "./status.js";
+import { aliasOf, logUsage } from "./usage-log.js";
 
 export type HandlerCtx = {
   from?: { id: number };
@@ -64,6 +65,10 @@ export function createBotHandlers(
   // Текущая страница списка (пагинация по 5, до 3 стр) — «Назад к списку»
   // возвращает пользователя на ту страницу, где он был, а не на первую.
   const lastPage = new Map<number, number>();
+  // Токен последнего запроса пользователя. Поиск фоновый: если юзер ввёл новый
+  // запрос, пока старый висел, старый по завершении не должен перезаписывать
+  // lastResults и редактировать сообщение. Сравниваем reqId — последний выигрывает.
+  const lastReqId = new Map<number, number>();
   // Rate limit в памяти. Отклонение от спеки (там был SQLite): для скользящего окна 60с
   // персистентность избыточна. При росте >100 юзеров перенести в db.countEventsSince.
   const hits = new Map<number, number[]>();
@@ -113,6 +118,8 @@ export function createBotHandlers(
 
     const text = ctx.message?.text?.trim();
     if (!text) return;
+    // Лог запроса для замера на реальном трафике. Команды (/start и т.п.) не пишем.
+    if (!text.startsWith("/")) logUsage({ event: "query", uh: aliasOf(id), q: text, len: text.length });
     // Защита от вставки длинного текста: иначе весь кусок улетает в LLM
     // (дорогой вызов, возможен таймаут). Реальные запросы к книгам короткие.
     if (text.length > cfg.maxQueryLen) {
@@ -134,6 +141,8 @@ export function createBotHandlers(
   }
 
   async function runSearch(ctx: HandlerCtx, id: number, text: string) {
+    const reqId = (lastReqId.get(id) ?? 0) + 1;
+    lastReqId.set(id, reqId);
     // Ленивый статус: на быстром пути (кэш-хит / быстрый промах < 700 мс) не
     // показываем ничего — иначе статус мерцал бы («появился → тут же список»).
     // Один нативный typing закрывает ленивое окно до 700 мс.
@@ -141,9 +150,42 @@ export function createBotHandlers(
     let ref: MsgRef | null = null;
     let pendingSend: Promise<MsgRef> | null = null;
     let resolved = false;
-    let currentPhase: "parsing" | "searching" = "parsing";
-    const phaseText = (p: "parsing" | "searching") =>
-      p === "parsing" ? "Разбираю запрос…" : "Ищу у себя в библиотеке…";
+    let currentPhase: SearchProgress = { kind: "parsing" };
+    // Throttle editMessage: пагинация плодовитого автора = до 10 страниц, а
+    // Telegram разрешает ~1 правку/сек. Частые обновления пропускаем, но
+    // отложенным флэшем гарантируем, что последнее состояние дойдёт.
+    // skip-if-same в status.ts гасит повторы одинакового текста.
+    let lastEditAt = 0;
+    let pendingFlush: ReturnType<typeof setTimeout> | null = null;
+    const THROTTLE_MS = 900;
+    const phaseText = (p: SearchProgress): string => {
+      switch (p.kind) {
+        case "parsing": return "Разбираю запрос…";
+        case "splitting": return "Перебираю разбиения запроса…";
+        case "title-search": return "Ищу по названию…";
+        case "author-found": return `Автор ${p.author}: ${p.books} книг в библиотеке`;
+        case "paging":
+          return `Листаю: страница ${p.page}/${p.totalPages || "?"}` + (p.found ? `, нашёл «${p.found}»` : "");
+        case "ranking": return `Сравниваю ${p.count} книг по релевантности…`;
+        default: return "Ищу у себя в библиотеке…"; // searching
+      }
+    };
+    const editProgress = (p: SearchProgress): void => {
+      currentPhase = p;
+      if (!ref) return; // статус ещё не отправлен — lazy send покажет currentPhase
+      const now = Date.now();
+      const elapsed = now - lastEditAt;
+      const flush = (): void => { lastEditAt = Date.now(); void msg.edit(ref!, phaseText(currentPhase)); };
+      if (elapsed >= THROTTLE_MS) {
+        flush();
+      } else if (!pendingFlush) {
+        pendingFlush = setTimeout(() => {
+          pendingFlush = null;
+          if (resolved || !ref) return;
+          flush();
+        }, THROTTLE_MS - elapsed);
+      }
+    };
 
     const lazy = setTimeout(() => {
       if (resolved) return;
@@ -167,10 +209,18 @@ export function createBotHandlers(
       let lowRelevance = false;
       await searchSem.acquire();
       try {
-        const r = await orchestrator.search(text, 15, (phase) => {
-          currentPhase = phase;
-          if (ref) void msg.edit(ref, phaseText(phase));
-        });
+        const r = await orchestrator.search(text, 15, editProgress);
+        // Race-защита: пока этот запрос висел, пользователь ввёл новый — старый
+        // результат выбрасываем. Не перезаписываем lastResults и не трогаем
+        // сообщение нового запроса; свой статус-сообщение убираем, чтобы не
+        // «оживало» позже старым списком поверх нового.
+        if (lastReqId.get(id) !== reqId) {
+          resolved = true;
+          clearTimeout(lazy);
+          if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
+          if (ref) await msg.delete(ref).catch(() => {});
+          return;
+        }
         books = r.books;
         degraded = r.degraded;
         lowRelevance = r.lowRelevance === true;
@@ -179,6 +229,7 @@ export function createBotHandlers(
       }
       resolved = true;
       clearTimeout(lazy);
+      if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
 
       if (!books.length) {
         const emptyText = "К сожалению ничего не нашёл. Попробуй написать запрос точнее, добавив автора или полное название книги.";
@@ -200,6 +251,7 @@ export function createBotHandlers(
     } catch (e) {
       resolved = true;
       clearTimeout(lazy);
+      if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
       console.error("search error:", (e as Error).message, "| query:", text);
       const r = await ensureRef();
       if (r) await msg.edit(r, "Поиск сломался. Извините.").catch(() => {});
@@ -251,6 +303,9 @@ export function createBotHandlers(
       const idx = Number(idxStr);
       const book = results[idx];
       if (!book) return;
+      // Скачивание = сильный implicit ground truth: пользователь выбрал книгу по
+      // этому запросу. Пара {q, book_id} — готовый seed для замера на реальном трафике.
+      logUsage({ event: "choose", uh: aliasOf(id), q: lastQuery.get(id) ?? null, book_id: book.id ?? null, title: book.title, author: book.author ?? null });
 
       let url: string;
       try {
@@ -366,7 +421,7 @@ const WELCOME_TEXT = `Привет. Это бот для поиска и ска�
 
 Получишь список книг с форматами, размером, числом скачиваний и переводом. Нажми на нужный тебе номер, и откроется описание, там выберешь формат для скачивания (fb2, epub, mobi, pdf, txt и другие).
 
-Поиск занимает 2-3 секунды.
+Поиск занимает 2-8 секунд: у плодовитых авторов бот листает страницы библиотеки, а не виснет — следи за статусом.
 
 «Просвещение — это выход человека из состояния своего несовершеннолетия, в котором он находится по собственной вине».`;
 
