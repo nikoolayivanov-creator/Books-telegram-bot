@@ -327,6 +327,58 @@ describe("relevance: fuzzy-матч названия с опечаткой (RC2)
   });
 });
 
+describe("royallib как вторичный источник", () => {
+  // royallib добирает книги, которых нет во flibusta (по title|author), но не
+  // дублирует уже найденное: flibusta приоритетна. Проверяем оба кейса.
+  const mkRoyallib = (books: any[]) => ({
+    searchBooks: vi.fn().mockResolvedValue(books),
+  });
+
+  it("добирает royallib-книгу, которой нет во flibusta", async () => {
+    const flibustaBooks = [{ title: "Белый Клык", author: "Лондон Джек", formats: ["fb2"] }];
+    const royBooks = [{ title: "Чужой роман", author: "Неизвестный", formats: ["epub"] }];
+    const m = makeMocks(flibustaBooks);
+    const roy = mkRoyallib(royBooks);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any, {}, roy as any);
+    const r = await o.search("белый клык джек лондон", 5);
+    const titles = r.books.map((b) => b.title);
+    expect(titles).toContain("Белый Клык");
+    expect(titles).toContain("Чужой роман");
+  });
+
+  it("не дублирует книгу, найденную и во flibusta, и в royallib (flibusta приоритетна)", async () => {
+    const flibustaBooks = [{ id: 1, title: "Белый Клык", author: "Лондон Джек", formats: ["fb2"] }];
+    const royBooks = [{ title: "Белый Клык", author: "Лондон Джек", formats: ["epub"], provider: "royallib" }];
+    const m = makeMocks(flibustaBooks);
+    const roy = mkRoyallib(royBooks);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any, {}, roy as any);
+    const r = await o.search("белый клык джек лондон", 5);
+    // Книга одна, и это flibusta-вариант (без provider="royallib")
+    expect(r.books).toHaveLength(1);
+    expect(r.books[0].provider).toBeUndefined();
+    expect(r.books[0].formats).toEqual(["fb2"]);
+  });
+
+  it("не дублирует при разном написании имени автора (дедуп по фамилии)", async () => {
+    const flibustaBooks = [{ id: 1, title: "Фрегат Паллада", author: "Гончаров Иван Александрович", formats: ["fb2"] }];
+    const royBooks = [{ title: "Фрегат Паллада", author: "Гончаров Иван", formats: ["epub"], provider: "royallib" }];
+    const m = makeMocks(flibustaBooks);
+    const roy = mkRoyallib(royBooks);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any, {}, roy as any);
+    const r = await o.search("фрегат паллада гончаров", 5);
+    // Фамилия «гончаров» совпадает — дубль схлопнут, остаётся flibusta-вариант.
+    expect(r.books).toHaveLength(1);
+    expect(r.books[0].provider).toBeUndefined();
+  });
+
+  it("без royallib (undefined) поиск работает как раньше", async () => {
+    const m = makeMocks([{ title: "Белый Клык", author: "Лондон Джек", formats: ["fb2"] }]);
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    const r = await o.search("белый клык джек лондон", 5);
+    expect(r.books).toHaveLength(1);
+  });
+});
+
 describe("RC3: путаница author/title", () => {
   // LLM на запросе из названия без автора занёс его в authors → ложный
   // author-поиск + штраф. Если единственный «автор» = названию — убираем его.
@@ -351,5 +403,65 @@ describe("RC3: путаница author/title", () => {
     const o = createOrchestrator(m.llm as any, m.flibusta as any);
     const r = await o.search("Пушкин", 5);
     expect(r.books[0].title).toBe("Пушкинская эпоха"); // author-поиск сохранился
+  });
+});
+
+describe("автор-строка поиска: слова, потерянные LLM", () => {
+  // Кейс жалобы: «Васильев Борис» → LLM отдала authors:["Васильев"], потеряв
+  // имя. В каталоге по голой фамилии ловится техническая заглушка. Слова
+  // запроса, не занятые title/series/genre/authors, возвращаются в автор-строку.
+  it("LLM отдала только фамилию: flibusta получает полную пару из запроса", async () => {
+    const books = [{ title: "Не стреляйте белых лебедей", author: "Васильев Борис Львович", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ authors: ["Васильев"] }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("Васильев Борис", 5);
+    expect(m.flibusta.searchBooks.mock.calls[0][0]).toEqual({ authors: ["Васильев Борис"] });
+  });
+
+  it("свободных слов нет: автор не расширяется", async () => {
+    const books = [{ title: "X", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ authors: ["Лотман"] }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("Лотман", 5);
+    expect(m.flibusta.searchBooks.mock.calls[0][0]).toEqual({ authors: ["Лотман"] });
+  });
+
+  it("остальных слов больше двух: расширения нет (защита от мусора в автор-строке)", async () => {
+    const books = [{ title: "X", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ authors: ["Мартин"] }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("Мартин игра престолов песнь льда", 5);
+    expect(m.flibusta.searchBooks.mock.calls[0][0].authors).toEqual(["Мартин"]);
+  });
+
+  it("предлоги из остатка в автор-строку не попадают", async () => {
+    const books = [{ title: "Пикник на обочине", author: "Стругацкие", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockResolvedValue({ authors: ["Стругацкие"] }), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("Аркадий и Борис Стругацкие", 5);
+    expect(m.flibusta.searchBooks.mock.calls[0][0].authors).toEqual(["Стругацкие Аркадий Борис"]);
+  });
+
+  it("деградация (LLM упала): расширения нет, title = сырой запрос", async () => {
+    const books = [{ title: "X", formats: ["fb2"] }];
+    const m = {
+      llm: { parseQuery: vi.fn().mockRejectedValue(new Error("llm down")), rankBooks: vi.fn() },
+      flibusta: { searchBooks: vi.fn().mockResolvedValue(books), splitSearchBooks: vi.fn().mockResolvedValue([]) },
+    };
+    const o = createOrchestrator(m.llm as any, m.flibusta as any);
+    await o.search("Васильев Борис", 5);
+    expect(m.flibusta.searchBooks.mock.calls[0][0]).toEqual({ title: "Васильев Борис" });
   });
 });

@@ -47,7 +47,7 @@ cp .env.example .env
 | `ADMIN_IDS` | да | - | Telegram ID админов через запятую, видят `/stats` |
 | `LLM_API_KEY` | да | - | ключ LLM-провайдера |
 | `LLM_BASE` | да | - | OpenAI-совместимый эндпоинт, напр. `https://openai.bothub.chat/v1` |
-| `MODEL` | да | - | модель, напр. `gpt-4.1-nano` |
+| `MODEL` | да | - | модель, напр. `gemini-2.5-flash` |
 | `FLIBUSTA_BASE` | да | - | зеркало Flibusta, напр. `https://flibusta.is` |
 | `FLIBUSTA_FALLBACK_BASE` | нет | - | запасное зеркало |
 | `ALLOWED_IDS` | нет | (пусто) | whitelist; пусто - бот публичный |

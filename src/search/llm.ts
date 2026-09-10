@@ -47,8 +47,9 @@ const RANK_PROMPT = `Ты ранжируешь результаты поиска
 
 // Жёсткий потолок одного LLM-вызова. Reasoning выключен, норма 2-3с; апстрим
 // изредка зависает — без таймаута пользователь ждёт минутами. По превышению
-// throw → orchestrator уходит в degraded-поиск (без LLM).
-const LLM_TIMEOUT_MS = 15_000;
+// throw → orchestrator уходит в degraded-поиск (без LLM). 8с: с запасом над
+// нормой, но быстрее отдаёт degraded-путь при зависшем апстриме.
+const LLM_TIMEOUT_MS = 8_000;
 
 export function createLlm(deps: LlmDeps) {
   async function complete(

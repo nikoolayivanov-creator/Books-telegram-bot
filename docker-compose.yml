@@ -1,14 +1,14 @@
 services:
-  flibusta-bot:
+  book-search-bot:
     build: .
-    container_name: flibusta-bot
+    container_name: book-search-bot
     restart: always
     env_file: .env
     volumes:
       - ./data:/data
       - ./logs:/logs
     tmpfs:
-      - /tmp/flibusta-downloads:size=200M
+      - /tmp/book-search-downloads:size=200M
     logging:
       driver: json-file
       options:

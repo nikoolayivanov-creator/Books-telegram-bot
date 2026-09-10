@@ -45,6 +45,28 @@ describe("downloader", () => {
     expect(got).toContain("<FictionBook");
   });
 
+  it("развёртывает pdf из zip-обёртки (/b/ID/download с type pdf+zip)", async () => {
+    const zip = new AdmZip();
+    zip.addFile("book.pdf", Buffer.from("%PDF-1.4 fake"));
+    global.fetch = vi.fn(async () => new Response(zip.toBuffer(), { status: 200 })) as any;
+    let got = "";
+    const onFile = async (p: string) => { got = (await fs.readFile(p)).toString(); return { size: got.length }; };
+    const d = createDownloader(tmp);
+    await d.fetchThen("https://flibusta.is/b/1/download", "Книга.pdf", onFile, "pdf");
+    expect(got).toContain("%PDF-");
+  });
+
+  it("не трогает сырой pdf без zip-обёртки", async () => {
+    global.fetch = vi.fn(async () =>
+      new Response(Buffer.from("%PDF-1.4 raw"), { status: 200 })
+    ) as any;
+    let got = "";
+    const onFile = async (p: string) => { got = (await fs.readFile(p)).toString(); return { size: got.length }; };
+    const d = createDownloader(tmp);
+    await d.fetchThen("https://flibusta.is/b/1/pdf", "Книга.pdf", onFile, "pdf");
+    expect(got).toContain("%PDF-1.4 raw");
+  });
+
   it("не трогает epub (zip — это и есть формат)", async () => {
     const zip = new AdmZip();
     zip.addFile("mimetype", Buffer.from("application/epub+zip"));

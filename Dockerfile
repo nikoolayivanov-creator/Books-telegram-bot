@@ -1,7 +1,9 @@
 FROM node:20-alpine AS build
 WORKDIR /app
-RUN apk add --no-cache python3 make g++
+# git нужен patch-package (применяет патчи через git apply)
+RUN apk add --no-cache python3 make g++ git
 COPY package.json package-lock.json ./
+COPY patches ./patches
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src
@@ -14,5 +16,5 @@ COPY --from=build /app/package.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY assets ./assets
-RUN mkdir -p /data /tmp/flibusta-downloads
+RUN mkdir -p /data /tmp/book-search-downloads
 CMD ["node", "dist/main.js"]

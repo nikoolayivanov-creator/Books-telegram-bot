@@ -7,7 +7,7 @@ vi.mock("flibusta", () => {
 });
 
 import FlibustaAPI from "flibusta";
-import { createFlibusta, chooseAuthorId } from "../src/search/flibusta.js";
+import { createFlibusta, chooseAuthorId, stripTitleStopWords } from "../src/search/flibusta.js";
 
 describe("chooseAuthorId", () => {
   it("точное совпадение имени предпочтительнее первого в списке", () => {
@@ -22,6 +22,24 @@ describe("chooseAuthorId", () => {
     const id = chooseAuthorId("Лондон", [
       { id: 1, name: "Лондон Джек" },
       { id: 2, name: "Джон Смит" },
+    ]);
+    expect(id).toBe(1);
+  });
+
+  it("голая фамилия-заглушка не выигрывает у полных имён с той же фамилией", () => {
+    // Кейс жалобы: getAuthors(«Васильев») содержит техническую запись «Васильев»
+    // (books=1), которая выигрывает по exact и уводит поиск в мусорный фид.
+    const id = chooseAuthorId("Васильев", [
+      { id: 321589, name: "Васильев", books: 1 },
+      { id: 168147, name: "Андрей Александрович Васильев", books: 79 },
+    ]);
+    expect(id).toBe(168147);
+  });
+
+  it("голая фамилия без полных конкурентов берётся по exact как раньше", () => {
+    const id = chooseAuthorId("Лондон", [
+      { id: 1, name: "Лондон", books: 5 },
+      { id: 2, name: "Джон Смит", books: 10 },
     ]);
     expect(id).toBe(1);
   });
@@ -47,8 +65,87 @@ describe("chooseAuthorId", () => {
   });
 });
 
+describe("stripTitleStopWords", () => {
+  it("убирает предлог «в», сохраняет частицу «не» (часть названия)", () => {
+    expect(stripTitleStopWords("Не стреляйте в белых лебедей")).toBe("не стреляйте белых лебедей");
+  });
+
+  it("название без стоп-слов проходит нормализованным", () => {
+    expect(stripTitleStopWords("Белый Клык")).toBe("белый клык");
+  });
+
+  it("пунктуация чистится до сравнения", () => {
+    expect(stripTitleStopWords("Война и мир")).toBe("война мир");
+  });
+});
+
 describe("flibusta wrapper", () => {
   afterEach(() => vi.clearAllMocks());
+
+  it("title с предлогом «в» и пустым фидом: повтор без стоп-слов находит книгу", async () => {
+    // Кейс жалобы: «Не стреляйте в белых лебедей» — на Flibusta книга без «в»,
+    // opensearch строгий, пустой фид роняет пакет (slice по undefined) либо [].
+    const byName = vi.fn()
+      .mockResolvedValueOnce([]) // первый заход: пусто
+      .mockResolvedValueOnce([ // повтор без «в»: нашлось
+        { title: "Не стреляйте белых лебедей", author: [{ name: "Васильев Борис Львович" }], categories: [], downloads: [{ link: "/b/1/fb2", type: "application/fb2+zip" }] },
+      ]);
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(),
+      getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: byName,
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const books = await f.searchBooks({ title: "Не стреляйте в белых лебедей" });
+    expect(byName).toHaveBeenCalledTimes(2);
+    expect(byName).toHaveBeenNthCalledWith(2, "не стреляйте белых лебедей");
+    expect(books.map((b) => b.title)).toContain("Не стреляйте белых лебедей");
+  });
+
+  it("title-поиск падает оба раза (retry): повтор без стоп-слов всё равно делается", async () => {
+    const sliceErr = new Error("Cannot read properties of undefined (reading 'slice')");
+    const byName = vi.fn()
+      .mockRejectedValueOnce(sliceErr) // withRetry: попытка 1
+      .mockRejectedValueOnce(sliceErr) // withRetry: попытка 2
+      .mockResolvedValueOnce([
+        { title: "Не стреляйте белых лебедей", author: [{ name: "Васильев Борис Львович" }], categories: [], downloads: [{ link: "/b/1/fb2", type: "application/fb2+zip" }] },
+      ]);
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(),
+      getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: byName,
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const books = await f.searchBooks({ title: "Не стреляйте в белых лебедей" });
+    expect(byName).toHaveBeenCalledTimes(3);
+    expect(books.map((b) => b.title)).toContain("Не стреляйте белых лебедей");
+  });
+
+  it("первый заход не пуст: повтора без стоп-слов нет", async () => {
+    const byName = vi.fn().mockResolvedValue([
+      { title: "Шерлок", author: [{ name: "Конан Дойль" }], categories: [], downloads: [{ link: "/b/1/fb2", type: "application/fb2+zip" }] },
+    ]);
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(),
+      getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: byName,
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    await f.searchBooks({ title: "Собака Баскервилей и Холмс" });
+    expect(byName).toHaveBeenCalledTimes(1);
+  });
+
+  it("в названии нет стоп-слов: второго вызова нет", async () => {
+    const byName = vi.fn().mockResolvedValue([]);
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(),
+      getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: byName,
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    await f.searchBooks({ title: "Белый Клык" });
+    expect(byName).toHaveBeenCalledTimes(1);
+  });
 
   it("searchBooks combines author-by-id + by-name results and dedups by id", async () => {
     (FlibustaAPI as any).mockImplementation(() => ({
@@ -99,6 +196,35 @@ describe("flibusta wrapper", () => {
     const books = await f.searchBooks({ title: "x" });
     expect(f.downloadUrl(books[0], "epub")).toBe("https://flibusta.is/b/9/epub");
   });
+
+  it("/b/ID/download: формат берётся из MIME-типа, а не метится fb2", async () => {
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(), getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: vi.fn().mockResolvedValue([
+        { title: "Диафильм", author: [], categories: [], downloads: [
+          { link: "/b/361093/download", type: "application/pdf+zip" },
+        ] },
+      ]),
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const books = await f.searchBooks({ title: "диафильм" });
+    expect(books[0].formats).toEqual(["pdf"]);
+    expect(f.downloadUrl(books[0], "pdf")).toBe("https://flibusta.is/b/361093/download");
+  });
+
+  it("/b/ID/download без MIME-типа остаётся fb2 (старое поведение)", async () => {
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(), getBooksByAuthorOpds: vi.fn(),
+      getBooksByNameFromOpds: vi.fn().mockResolvedValue([
+        { title: "X", author: [], categories: [], downloads: [
+          { link: "/b/5/download" },
+        ] },
+      ]),
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const books = await f.searchBooks({ title: "x" });
+    expect(books[0].formats).toEqual(["fb2"]);
+  });
 });
 
 describe("searchBooks: стриминг title-поиска", () => {
@@ -136,6 +262,48 @@ describe("searchBooks: стриминг title-поиска", () => {
     const kinds = events.map((e) => e.kind);
     expect(kinds).not.toContain("title-search");
     expect(kinds).toContain("author-found");
+  });
+});
+
+describe("searchBooks: retry при флаке flibusta", () => {
+  afterEach(() => vi.clearAllMocks());
+
+  // flibusta.is нестабильна (~3 из 5 запросов зависают). Один повтор должен
+  // поднять книгу из «пусто» до «найдено» и сообщить прогресс retry, чтобы
+  // статус в чате не выглядел зависанием.
+  it("title-поиск: первый вызов падает, второй находит — стримит retry", async () => {
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn(),
+      getBooksByAuthorOpdsPaginated: vi.fn(),
+      getBooksByNameFromOpds: vi.fn()
+        .mockRejectedValueOnce(new Error("timeout"))
+        .mockResolvedValueOnce([
+          { title: "X", author: [], downloads: [{ link: "/b/9/fb2" }] },
+        ]),
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const events: any[] = [];
+    const books = await f.searchBooks({ title: "что-то" }, (p) => events.push(p));
+    expect(books[0].title).toBe("X");
+    expect(events.map((e) => e.kind)).toEqual(["title-search", "retry"]);
+  });
+
+  it("author-поиск: getAuthors падает один раз, потом находит автора", async () => {
+    (FlibustaAPI as any).mockImplementation(() => ({
+      getAuthors: vi.fn()
+        .mockRejectedValueOnce(new Error("timeout"))
+        .mockResolvedValueOnce([{ id: 1, name: "Автор", books: 1 }]),
+      getBooksByAuthorOpdsPaginated: vi.fn().mockResolvedValue({
+        items: [{ title: "Роман", author: [{ name: "Автор" }], downloads: [{ link: "/b/1/fb2" }] }],
+        currentPage: 0, hasNextPage: false, hasPreviousPage: false,
+      }),
+      getBooksByNameFromOpds: vi.fn(),
+    }));
+    const f = createFlibusta({ base: "https://flibusta.is" });
+    const events: any[] = [];
+    const books = await f.searchBooks({ authors: ["Автор"] }, (p) => events.push(p));
+    expect(books[0].title).toBe("Роман");
+    expect(events.map((e) => e.kind)).toContain("retry");
   });
 });
 

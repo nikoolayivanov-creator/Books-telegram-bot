@@ -10,9 +10,11 @@ type OnFile = (filePath: string) => Promise<DownloadMeta>;
 // одним .fb2 внутри. Если отправить такой zip под именем «Книга.fb2», читалка
 // ждёт XML и файл не открывается — отсюда впечатление, что «работает только
 // mobi» (он идёт сырым файлом). Распаковываем внутренний файл перед отправкой.
-// epub/pdf/mobi НЕ трогаем: epub сам по себе zip (вскрывать нельзя), pdf и mobi
-// приходят уже готовым файлом.
-const WRAP_FORMATS = new Set(["fb2", "txt", "rtf", "html", "doc"]);
+// pdf и djvu добавлены из-за ссылок /b/ID/download (type pdf+zip) — там pdf
+// внутри zip-обёртки; разворачивание безопасно: unwrapZip распаковывает только
+// файлы с PK-магией, сырой pdf (%PDF-) и mobi проходят как есть.
+// epub НЕ трогаем: epub сам по себе zip, вскрывать нельзя.
+const WRAP_FORMATS = new Set(["fb2", "txt", "rtf", "html", "doc", "pdf", "djvu"]);
 
 function unwrapZip(buf: Buffer): Buffer {
   if (!(buf[0] === 0x50 && buf[1] === 0x4b)) return buf; // PK — не zip

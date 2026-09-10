@@ -7,6 +7,7 @@ import type { Db } from "./db.js";
 import { createOrchestrator, type SearchProgress } from "./search/orchestrator.js";
 import { createLlm } from "./search/llm.js";
 import { createFlibusta, type Flibusta, type FlibustaBook } from "./search/flibusta.js";
+import { createRoyallib, type Royallib } from "./search/royallib.js";
 import { createDownloader } from "./download.js";
 import { bookListKeyboard, formatsKeyboard, bookListText, bookCardText } from "./keyboards.js";
 import { createStatusMessenger, type StatusMessenger, type MsgRef } from "./status.js";
@@ -50,6 +51,7 @@ export function createBotHandlers(
   downloader: ReturnType<typeof createDownloader>,
   flibusta: Flibusta,
   messenger?: StatusMessenger,
+  royallib?: Royallib,
 ) {
   // Статус-сообщения (прогресс скачивания, фазы поиска). Опционально: тестам,
   // которым статус не нужен, передавать фейк не требуется — no-op по умолчанию.
@@ -79,9 +81,10 @@ export function createBotHandlers(
   // и без кулдауна каждый плодил бы дубль файла.
   const lastDownload = new Map<string, number>();
   const DOWNLOAD_COOLDOWN_MS = 10_000;
-  // Ограничители параллельности дорогих операций (защита upstream). 5 — потолок
-  // одновременных LLM-вызовов и параллельных скачиваний flibusta.
-  const searchSem = makeSemaphore(5);
+  // Ограничители параллельности дорогих операций (защита upstream). Поиск — 2:
+  // серия запросов иначе затапливает flibusta сотней одновременных вызовов →
+  // троттлинг и «зависание». Скачивание — 5.
+  const searchSem = makeSemaphore(2);
   const downloadSem = makeSemaphore(5);
   // Реестр фоновых задач: обработчик запускает поиск/скачивание в фоне и сразу
   // возвращается, grammY эту работу не ждёт. idle() позволяет тестам дождаться
@@ -166,6 +169,7 @@ export function createBotHandlers(
         case "author-found": return `Автор ${p.author}: ${p.books} книг в библиотеке`;
         case "paging":
           return `Листаю: страница ${p.page}/${p.totalPages || "?"}` + (p.found ? `, нашёл «${p.found}»` : "");
+        case "retry": return "Библиотека не ответила, пробую ещё раз…";
         case "ranking": return `Сравниваю ${p.count} книг по релевантности…`;
         default: return "Ищу у себя в библиотеке…"; // searching
       }
@@ -193,6 +197,17 @@ export function createBotHandlers(
       pendingSend.then((r) => { if (!resolved) ref = r; }).catch(() => {});
     }, 700);
 
+    // Таймер «медленно»: если спустя 5с поиск всё ещё идёт — источник тупит, и
+    // статус «Ищу…» читается пользователем как зависание. Показываем явно, что
+    // бот жив и продолжает. Одноразовый: последующие события (retry, paging,
+    // финальный список) перезатрут его своим, более конкретным текстом.
+    let slowTimer: ReturnType<typeof setTimeout> | null = null;
+    slowTimer = setTimeout(() => {
+      if (resolved || !ref) return;
+      lastEditAt = Date.now();
+      void msg.edit(ref, "Библиотека отвечает медленно, но я продолжаю искать…").catch(() => {});
+    }, 5_000);
+
     // Если статус уже в полёте (send запущен, но не завершился к моменту ответа) —
     // дождаться его и положить финальный текст в то же сообщение, а не отдельным
     // reply. Иначе на переходном окне 700–1000 мс статус и список были бы двумя
@@ -217,6 +232,7 @@ export function createBotHandlers(
         if (lastReqId.get(id) !== reqId) {
           resolved = true;
           clearTimeout(lazy);
+          if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
           if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
           if (ref) await msg.delete(ref).catch(() => {});
           return;
@@ -229,6 +245,7 @@ export function createBotHandlers(
       }
       resolved = true;
       clearTimeout(lazy);
+      if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
       if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
 
       if (!books.length) {
@@ -251,6 +268,7 @@ export function createBotHandlers(
     } catch (e) {
       resolved = true;
       clearTimeout(lazy);
+      if (slowTimer) { clearTimeout(slowTimer); slowTimer = null; }
       if (pendingFlush) { clearTimeout(pendingFlush); pendingFlush = null; }
       console.error("search error:", (e as Error).message, "| query:", text);
       const r = await ensureRef();
@@ -309,7 +327,11 @@ export function createBotHandlers(
 
       let url: string;
       try {
-        url = flibusta.downloadUrl(book, fmt);
+        // Роутинг по источнику книги: royallib-книга скачивается своим клиентом,
+        // иначе flibusta. Ссылки royallib уже абсолютные (заполнены при разборе
+        // карточки), flibusta — относительные, её клиент сам приклеивает base.
+        const source = book.provider === "royallib" && royallib ? royallib : flibusta;
+        url = source.downloadUrl(book, fmt);
       } catch (e) {
         console.error("download url fail:", (e as Error).message, "| book:", book.title, "| fmt:", fmt);
         await ctx.reply("Нет ссылки на этот формат. Выбери другой.");
@@ -430,17 +452,18 @@ const WELCOME_TEXT = `Привет. Это бот для поиска и ска�
 export function buildApp(cfg: Config, db: Db) {
   const llm = createLlm({ llmBase: cfg.llmBase, llmApiKey: cfg.llmApiKey, model: cfg.model });
   const flibusta = createFlibusta({ base: cfg.flibustaBase, fallbackBase: cfg.flibustaFallbackBase });
+  const royallib = createRoyallib({ base: cfg.royallibBase ?? "https://royallib.com" });
   const orchestrator = createOrchestrator(llm, flibusta, {
     cacheTtlSec: cfg.searchCacheTtlSec,
     cacheMax: cfg.searchCacheMax,
-  });
+  }, royallib);
   const analytics = createAnalytics(db);
   const downloader = createDownloader("/tmp/book-search-downloads");
   const bot = new Bot(cfg.botToken);
   // messenger берёт уже собранный bot.api: статус правит наши собственные
   // сообщения по id через bot.api.editMessageText, а не входящее через ctx.
   const messenger = createStatusMessenger(bot.api);
-  const handlers = createBotHandlers(cfg, orchestrator, analytics, downloader, flibusta, messenger);
+  const handlers = createBotHandlers(cfg, orchestrator, analytics, downloader, flibusta, messenger, royallib);
   // ctx в grammY содержит токен бота. При ошибке логируем только сообщение и
   // update_id — не весь ctx, иначе токен попадает в постоянные логи.
   bot.catch((err) => {

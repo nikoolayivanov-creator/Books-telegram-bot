@@ -18,6 +18,7 @@ const Env = z.object({
     z.string().url().optional(),
   ),
   FLIBUSTA_PROXY: z.string().optional(),
+  ROYALLIB_BASE: z.string().url().optional(),
   RATE_LIMIT_PER_MIN: z.string().optional(),
   LOG_TTL_DAYS: z.string().optional(),
   SEARCH_CACHE_TTL_SEC: z.string().optional(),
@@ -37,6 +38,7 @@ export type Config = {
   flibustaBase: string;
   flibustaFallbackBase?: string;
   flibustaProxy?: string;
+  royallibBase?: string;
   rateLimitPerMin: number;
   logTtlDays?: number;
   searchCacheTtlSec: number;
@@ -60,6 +62,7 @@ export function loadConfig(): Config {
     flibustaBase: e.FLIBUSTA_BASE,
     flibustaFallbackBase: e.FLIBUSTA_FALLBACK_BASE,
     flibustaProxy: e.FLIBUSTA_PROXY,
+    royallibBase: e.ROYALLIB_BASE,
     rateLimitPerMin: e.RATE_LIMIT_PER_MIN ? Number(e.RATE_LIMIT_PER_MIN) : 20,
     logTtlDays: e.LOG_TTL_DAYS ? Number(e.LOG_TTL_DAYS) : undefined,
     searchCacheTtlSec: e.SEARCH_CACHE_TTL_SEC ? Number(e.SEARCH_CACHE_TTL_SEC) : 21600,

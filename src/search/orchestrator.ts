@@ -1,5 +1,7 @@
 import type { Llm } from "./llm.js";
 import type { Flibusta, FlibustaBook } from "./flibusta.js";
+import type { Royallib } from "./royallib.js";
+import { TITLE_STOP_WORDS } from "./flibusta.js";
 
 export type SearchResult = { books: FlibustaBook[]; degraded: boolean; lowRelevance?: boolean };
 
@@ -13,6 +15,7 @@ export type SearchProgress =
   | { kind: "title-search" }
   | { kind: "author-found"; author: string; books: number }
   | { kind: "paging"; page: number; totalPages: number; booksSoFar: number; found?: string }
+  | { kind: "retry"; what: "title" | "author" }
   | { kind: "ranking"; count: number };
 
 const norm = (s: string): string =>
@@ -48,6 +51,23 @@ function levenshtein(a: string, b: string): number {
 function similarity(a: string, b: string): number {
   const maxLen = Math.max(a.length, b.length);
   return maxLen ? 1 - levenshtein(a, b) / maxLen : 1;
+}
+
+// Общий deadline на поисковый пул. Медленная/затроттленная Flibusta иначе
+// держит union-поиск десятками секунд: per-call таймауты (5с) срабатывают
+// по очереди, а split перебирает несколько вызовов последовательно в каждом
+// разбиении. Потолок отбрасывает зависший пул (catch → []) и не блокирует
+// выдачу другого. 16с: нормальный пул 1-7с + запас под один retry флака flibusta
+// (5с×2 на title), хвост отсекается до «вечного Ищу…».
+const SEARCH_DEADLINE_MS = 16_000;
+function deadline<T>(p: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bomb = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("search deadline exceeded")), SEARCH_DEADLINE_MS);
+  });
+  return Promise.race([p, bomb]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 // Детерминированная релевантность. Оцениваем не по сырому запросу, а по тому,
@@ -129,7 +149,8 @@ export function relevance(pt: string, authors: string[], series: string | undefi
 export function createOrchestrator(
   llm: Llm,
   flibusta: Flibusta,
-  opts: { cacheTtlSec?: number; cacheMax?: number } = {},
+  opts: { cacheTtlSec?: number; cacheEmptyTtlSec?: number; cacheMax?: number } = {},
+  royallib?: Royallib,
 ) {
   // In-memory кэш результатов поиска. Одинаковые запросы разных пользователей
   // («пелевин», «гари поттер») иначе бьют по flibusta и LLM десятками раз.
@@ -137,6 +158,11 @@ export function createOrchestrator(
   // детерминированный, книги не меняются каждую минуту — кэшировать безопасно.
   // Сбрасывается при рестарте; для поискового кэша персистентность избыточна.
   const ttlMs = (opts.cacheTtlSec ?? 21600) * 1000;
+  // Пустой результат («ничего не найдено») кэшируем коротко: сбой источника
+  // нельзя превращать в 6-часовой отказ. 10 минут гасят повторный мусор
+  // (опечатки, несуществующие книги), но временная недоступность Flibusta
+  // переживается за минуты, а не часы.
+  const emptyTtlMs = (opts.cacheEmptyTtlSec ?? 600) * 1000;
   const max = opts.cacheMax ?? 2000;
   type Entry = { result: SearchResult; expiresAt: number };
   const cache = new Map<string, Entry>();
@@ -147,7 +173,7 @@ export function createOrchestrator(
     if (Date.now() > e.expiresAt) { cache.delete(key); return undefined; }
     return e.result;
   };
-  const cachePut = (key: string, result: SearchResult): void => {
+  const cachePut = (key: string, result: SearchResult, ttlOverride?: number): void => {
     if (cache.size >= max) {
       const now = Date.now();
       for (const [k, v] of cache) if (now > v.expiresAt) cache.delete(k);
@@ -157,7 +183,7 @@ export function createOrchestrator(
         if (oldest !== undefined) cache.delete(oldest);
       }
     }
-    cache.set(key, { result, expiresAt: Date.now() + ttlMs });
+    cache.set(key, { result, expiresAt: Date.now() + (ttlOverride ?? ttlMs) });
   };
 
   return {
@@ -199,6 +225,30 @@ export function createOrchestrator(
       let authors = parsed.authors ?? [];
       if (authors.length === 1 && pt && norm(authors[0]) === pt) authors = [];
 
+      // Слова запроса, не объяснённые разбором. LLM нередко теряет имя автора
+      // («Васильев Борис» → authors:["Васильев"]), и по голой фамилии каталог
+      // отдаёт заглушку-дубль вместо живого автора. Если автор один и остаток
+      // запроса — 1-2 слова, возвращаем их в автор-строку ПОИСКА (flibusta и
+      // royallib); ранжирование остаётся на исходных authors — фамилии из
+      // запроса хватает, чтобы сматчить полное имя в библиографии. Предлоги из
+      // остатка выкидываем («Аркадий и Борис Стругацкие» → «Стругацкие Аркадий
+      // Борис»). Более двух слов не берём: это уже не имя, а мусор запроса.
+      const used = new Set(
+        [parsed.title, parsed.series, parsed.genre, ...authors]
+          .flatMap((s) => (s ? norm(s).split(" ") : []))
+          .filter(Boolean),
+      );
+      const restWords = rawQuery
+        .split(/[\s«»"'!.,?;:()\[\]]+/)
+        .filter((w) => {
+          const n = norm(w);
+          return n && !used.has(n) && !TITLE_STOP_WORDS.has(n);
+        });
+      const searchParsed =
+        authors.length === 1 && restWords.length >= 1 && restWords.length <= 2
+          ? { ...parsed, authors: [`${authors[0]} ${restWords.join(" ")}`] }
+          : parsed;
+
       onProgress?.({ kind: "searching" });
       // split работает от 2 токенов и идёт параллельно как страховка; стримим
       // отдельный статус, чтобы title-only путь не молчал от «Ищу...» до «Сравниваю...».
@@ -209,13 +259,18 @@ export function createOrchestrator(
       // оценивается своим разбором; в общий пул книга идёт с максимумом оценок
       // — «лучший сценарий» её нахождения. ~80% rel@3 против 69% у LLM-соло.
       // Адаптер пробрасывает прогресс пагинации flibusta в общий колбэк.
-      const [llmRaw, splitRaw] = await Promise.all([
-        flibusta
-          .searchBooks(parsed, (fp) => onProgress?.(fp), { targetTitle: pt })
+      // royallib — вторичный источник параллельно flibusta. Книги, которых нет
+      // во flibusta (по title|author), добираем ниже. Упал/завис — просто [].
+      const [llmRaw, splitRaw, royRaw] = await Promise.all([
+        deadline(flibusta
+          .searchBooks(searchParsed, (fp) => onProgress?.(fp), { targetTitle: pt }))
           .catch(() => [] as FlibustaBook[]),
-        flibusta
-          .splitSearchBooks(rawQuery)
+        deadline(flibusta
+          .splitSearchBooks(rawQuery))
           .catch(() => [] as Array<{ book: FlibustaBook; pt: string; authors: string[] }>),
+        royallib
+          ? deadline(royallib.searchBooks(searchParsed)).catch(() => [] as FlibustaBook[])
+          : Promise.resolve([] as FlibustaBook[]),
       ]);
 
       // При равной релевантности — популярное издание (больше скачиваний) выше.
@@ -229,20 +284,41 @@ export function createOrchestrator(
         const ex = pool.get(k);
         if (!ex || s > ex.s) pool.set(k, { b, s });
       };
-      for (const b of llmRaw) merge(b, relevance(pt, authors, parsed.series, b));
+      // Ключи flibusta-книг (title|фамилия автора) — для дедупа royallib: одна и та
+      // же книга не должна показываться дважды (из flibusta и из royallib). flibusta
+      // приоритетна (у неё точнее id-дедуп и полнее метаданные). Фамилия, а не полное
+      // имя: flibusta пишет «Гончаров Иван Александрович», royallib — «Гончаров Иван»,
+      // точное сравнение имени не ловило бы дубль, а фамилия (первый токен) совпадает.
+      const flKeyOf = (b: FlibustaBook): string => {
+        const fam = norm(b.author ?? "").split(" ").find(Boolean) ?? "";
+        return norm(b.title) + "|" + fam;
+      };
+      const flKey = new Set<string>();
+      for (const b of llmRaw) {
+        flKey.add(flKeyOf(b));
+        merge(b, relevance(pt, authors, parsed.series, b));
+      }
       // split-книги ранжируем по LLM-авторам, когда LLM их дал: это единая правда
       // об авторе запроса. Разбиение split («александр») иначе матчит чужих
       // авторов по совпадению имени и пропускает книги о Пушкине авторов-Александров.
       // Без LLM-авторов (title-only, degraded) — по разбиению split, как раньше.
       for (const r of splitRaw) {
+        flKey.add(flKeyOf(r.book));
         const ra = authors.length ? authors : r.authors;
         merge(r.book, relevance(r.pt, ra, undefined, r.book));
       }
+      // royallib добирает то, чего нет во flibusta: тот же title|author — пропуск.
+      for (const b of royRaw) {
+        if (flKey.has(flKeyOf(b))) continue;
+        merge(b, relevance(pt, authors, parsed.series, b));
+      }
 
       if (!pool.size) {
-        // Пустой результат кэшируем — легитимное «ничего нет», спасает от
-        // повторных вызовов на опечатки и несуществующие книги.
-        cachePut(key, { books: [], degraded });
+        // Пустой результат кэшируем коротко (emptyTtlMs): «ничего нет» может быть
+        // и легитимным (опечатка, несуществующая книга), и сбоем источника — мы их
+        // не различаем. Короткий TTL гасит повторный мусор, но не превращает
+        // временную недоступность Flibusta в 6-часовой отказ.
+        cachePut(key, { books: [], degraded }, emptyTtlMs);
         return { books: [], degraded };
       }
 

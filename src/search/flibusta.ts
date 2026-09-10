@@ -22,6 +22,9 @@ export type FlibustaBook = {
   series?: string;
   translator?: string;
   language?: string;
+  // Источник книги ("flibusta" | "royallib"): по нему bot.ts выбирает клиент
+  // для downloadUrl. flibusta ставит всегда; другие провайдеры — своё значение.
+  provider?: string;
 };
 
 type Deps = { base: string; fallbackBase?: string; httpAgent?: unknown };
@@ -62,14 +65,35 @@ function parseDescription(desc: string | undefined): { annotation?: string; meta
   };
 }
 
+// У части книг ссылка /b/ID/download без формата в пути — формат тогда виден
+// только в MIME-типе (диафильм: /b/361093/download с application/pdf+zip).
+// Раньше такие ссылки слепо метились fb2, и под fb2-кнопкой уезжал pdf.
+const MIME_TO_FORMAT: [RegExp, string][] = [
+  [/fb2/, "fb2"],
+  [/epub/, "epub"],
+  [/mobipocket/, "mobi"],
+  [/pdf/, "pdf"],
+  [/djvu/, "djvu"],
+  [/txt/, "txt"],
+  [/rtf/, "rtf"],
+  [/html/, "html"],
+  [/msword/, "doc"],
+];
+
+function formatFromMime(mime: unknown): string {
+  if (typeof mime !== "string") return "fb2"; // /b/ID/download без MIME — исторически fb2 в zip
+  const hit = MIME_TO_FORMAT.find(([re]) => re.test(mime));
+  return hit ? hit[1] : "fb2";
+}
+
 function normalize(raw: any, base: string): FlibustaBook {
   const downloads: { link: string; format: string }[] = (raw.downloads ?? [])
     .filter((d: any) => d?.link)
     .map((d: any) => {
       const m = String(d.link).match(FORMAT_RE);
-      // /b/ID/download — дефолтный формат flibusta (fb2 в zip). Нормализуем к fb2.
-      const fmt = m ? m[1] : "";
-      return { link: String(d.link), format: fmt === "download" ? "fb2" : fmt };
+      const fromPath = m ? m[1] : "";
+      const fmt = !fromPath || fromPath === "download" ? formatFromMime(d.type) : fromPath;
+      return { link: String(d.link), format: fmt };
     });
   const formats = Array.from(new Set(downloads.map((d) => d.format)))
     .filter((f) => f && f !== "unknown");
@@ -86,6 +110,7 @@ function normalize(raw: any, base: string): FlibustaBook {
     coverUrl: raw.cover ? base + raw.cover : undefined,
     downloads,
     formats,
+    provider: "flibusta",
     ...meta,
   };
 }
@@ -97,12 +122,29 @@ function normName(s: string): string {
   return s.toLowerCase().replace(/ё/g, "е").replace(/[«»"'!.,?;:()\[\]]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+// Предлоги и союзы, которых часто нет в названии книги в каталоге: запрос
+// «Не стреляйте в белых лебедей» там хранится без «в», и строгий opensearch
+// по полной строке возвращает ноль. Частицу «не» НЕ выкидываем: она часть
+// самих названий («Не стреляйте», «Не навеки»).
+export const TITLE_STOP_WORDS = new Set([
+  "в", "во", "на", "по", "о", "об", "от", "до", "для", "у", "за", "с", "со",
+  "к", "ко", "при", "и", "а", "но", "да", "или", "же", "бы", "под", "над",
+  "без", "через", "про", "из", "между", "перед", "после",
+]);
+
+// Название без предлогов/союзов — для повторного захода, когда строгий поиск
+// по полной строке ничего не вернул. Нормализация как в normName.
+export function stripTitleStopWords(title: string): string {
+  return normName(title).split(" ").filter((w) => w && !TITLE_STOP_WORDS.has(w)).join(" ");
+}
+
 // Таймаут на одиночный вызов к Flibusta. Пакет под капотом гоняет axios без
 // per-request timeout: под rate-limit одиночный запрос висит на TCP-уровне
 // минутами, и пользователь видит вечное «Ищу...». Promise.race обрывает ожидание
-// вызывающего (сам axios-запрос догниёт в фоне и соберётся GC). 12с — потолок
-// на одну страницу/поиск: нормальная страница ~1с, всё что дольше — stall.
-const CALL_TIMEOUT_MS = 12_000;
+// вызывающего (сам axios-запрос догниёт в фоне и соберётся GC). 5с — потолок на
+// одну страницу/поиск: нормальная страница ~1с, ответ медленнее 4с уже исключение.
+// 5с (а не 6с) оставляет запас под retry в общий deadline orchestrator (16с).
+const CALL_TIMEOUT_MS = 5_000;
 function withTimeout<T>(p: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const bomb = new Promise<never>((_, reject) => {
@@ -111,6 +153,24 @@ function withTimeout<T>(p: Promise<T>, ms: number = CALL_TIMEOUT_MS): Promise<T>
   return Promise.race([p, bomb]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+
+// Повтор при сбое (таймаут/сетевая ошибка). flibusta.is нестабильна: ~3 из 5
+// одиночных запросов зависают до таймаута, но следующая попытка часто проходит
+// за доли секунды. Один повтор даёт заметный прирост покрытия при +5с worst-case.
+// onRetry вызывается перед повтором — это сигнал прогресса для статуса в чате
+// (пользователь видит «пробую ещё раз», а не вечное «Ищу...»).
+async function withRetry<T = any>(fn: () => Promise<T>, onRetry?: () => void, attempts = 2): Promise<T> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) onRetry?.();
+    }
+  }
+  throw lastErr;
 }
 
 // Выбор автора из списка совпадений Flibusta. getAuthors возвращает несколько
@@ -131,7 +191,18 @@ export function chooseAuthorId(
   if (!req) return byPopularity();
 
   const exact = authors.find((a) => normName(a.name) === req);
-  if (exact) return exact.id;
+  // Голая фамилия как точное совпадение — обычно техническая заглушка каталога
+  // (запись «Васильев» с books=1), вытесняющая полные имена живых авторов из
+  // выдачи getAuthors. Если среди кандидатов есть полные имена с этим словом —
+  // не отдаём победу заглушке: проваливаемся ниже, где при равной длине
+  // совпадения решает плодовитость (books).
+  const hasFullerName =
+    !req.includes(" ") &&
+    authors.some((a) => {
+      const n = normName(a.name);
+      return n !== req && n.split(" ").includes(req);
+    });
+  if (exact && !hasFullerName) return exact.id;
 
   let bestInc: { id: number; len: number; books: number } | null = null;
   for (const a of authors) {
@@ -169,10 +240,10 @@ export function chooseAuthorId(
 // молча терял большинство книг. Перебираем страницы, пока есть next-link.
 //
 // Бюджет ограничивает нагрузку и латентность: потолок страниц и потолок времени
-// на одного автора. 15 страниц × 20 = до 300 записей — покрывает Ефремова (10
-// стр.) с запасом. Таймаут 8с: OPDS-страница ~1с, 8с ≈ 8 страниц — хватает до
-// page 6-7, где у плодовитых авторов лежат основные романы (у Ефремова «Таис
-// Афинская» на page 6). Меньше — теряем книги; больше — пользователь ждёт.
+// на одного автора. 12 страниц × 20 = до 240 записей — покрывает Ефремова (10
+// стр.). Таймаут 6с: OPDS-страница ~1с, 6с ≈ 6 страниц — хватает до page 6,
+// где у плодовитых авторов лежат основные романы (у Ефремова «Таис Афинская»
+// на page 6). Меньше — теряем книги; больше — пользователь ждёт.
 // Повторные запросы берутся из кэша orchestrator (6ч).
 // Прогресс поиска для стриминга в чат. author-found — выбрали автора из списка
 // тезок, знаем объём его библиографии; paging — перебор страниц с накопленным
@@ -180,7 +251,8 @@ export function chooseAuthorId(
 export type FlibustaProgress =
   | { kind: "author-found"; author: string; books: number }
   | { kind: "paging"; page: number; totalPages: number; booksSoFar: number; found?: string }
-  | { kind: "title-search" };
+  | { kind: "title-search" }
+  | { kind: "retry"; what: "title" | "author" };
 
 async function searchBooksByAuthor(
   client: any,
@@ -260,12 +332,46 @@ export function createFlibusta(deps: Deps) {
       const client = makeClient(deps.base);
       const out: FlibustaBook[] = [];
 
+      // По названию — первым: один быстрый вызов и самый точный результат для
+      // запроса «название + автор». Retry гасит флаки flibusta.is: одиночный
+      // таймаут не должен отдавать пустую выдачу, если следующая попытка прошла бы.
+      if (q.title) {
+        // Стримим отдельный статус: title-only поиск иначе молчит от «Ищу...»
+        // до «Сравниваю...», пока ждёт одиночный getBooksByNameFromOpds.
+        onProgress?.({ kind: "title-search" });
+        try {
+          const list = await withRetry(
+            () => (client as any).getBooksByNameFromOpds(q.title),
+            () => onProgress?.({ kind: "retry", what: "title" }),
+          );
+          if (Array.isArray(list)) out.push(...list.map((r) => normalize(r, deps.base)));
+        } catch { /* зеркало упало — fallback ниже */ }
+        // Стоп-слово в запросе, которого нет в названии в каталоге, роняет
+        // строгий opensearch в ноль («Не стреляйте в белых лебедей» хранится
+        // без «в»). Первый заход пуст — повторяем без предлогов/союзов.
+        if (!out.length) {
+          const stripped = stripTitleStopWords(q.title);
+          if (stripped && stripped !== normName(q.title)) {
+            try {
+              const list = await withRetry(
+                () => (client as any).getBooksByNameFromOpds(stripped),
+                () => onProgress?.({ kind: "retry", what: "title" }),
+              );
+              if (Array.isArray(list)) out.push(...list.map((r) => normalize(r, deps.base)));
+            } catch { /* и без стоп-слов пусто — автор/fallback ниже */ }
+          }
+        }
+      }
+
       // По автору: сначала найти id, потом тянуть полную библиографию
       // (пагинация OPDS, иначе у плодовитых авторов доступна только 1-я страница)
       if (q.authors?.length) {
         for (const a of q.authors) {
           try {
-            const authors = await (client as any).getAuthors(a);
+            const authors = await withRetry(
+              () => (client as any).getAuthors(a),
+              () => onProgress?.({ kind: "retry", what: "author" }),
+            );
             const list = authors ?? [];
             const id = chooseAuthorId(a, list);
             if (id) {
@@ -275,24 +381,13 @@ export function createFlibusta(deps: Deps) {
                 onProgress?.({ kind: "author-found", author: authorObj?.name ?? a, books: booksCount });
               }
               const found = await searchBooksByAuthor(client as any, id, deps.base, {
-                maxPages: 15,
-                maxTimeMs: 8000,
+                maxPages: 12,
+                maxTimeMs: 6000,
               }, { booksCount, targetTitle: opts?.targetTitle, onProgress });
               out.push(...found);
             }
           } catch { /* автор не найден — пропускаем */ }
         }
-      }
-
-      // По названию
-      if (q.title) {
-        // Стримим отдельный статус: title-only поиск иначе молчит от «Ищу...»
-        // до «Сравниваю...», пока ждёт одиночный getBooksByNameFromOpds.
-        onProgress?.({ kind: "title-search" });
-        try {
-          const list = await (client as any).getBooksByNameFromOpds(q.title);
-          if (Array.isArray(list)) out.push(...list.map((r) => normalize(r, deps.base)));
-        } catch { /* зеркало упало — fallback ниже */ }
       }
 
       // Дедуп по id книги: разные издания (один /b/id) — схлопываем, но
